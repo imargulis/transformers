@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from enum import Enum
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Tuple
 
 import torch
 
@@ -66,9 +66,7 @@ class CacheContent:
             self.values: Optional[torch.Tensor] = None
         else:  # POST_NORM or POST_NORM_CL
             self.hidden_states: Optional[torch.Tensor] = None
-        
-
-    
+           
     def __repr__(self):
         if self.content_type == CacheContentType.POST_PROJ:
             keys_shape = self.keys.shape if self.keys is not None else None
@@ -109,16 +107,16 @@ class CacheContent:
         else:
             return self.hidden_states.dtype if self.hidden_states is not None else None
         
-    def get_total_size(self) -> int:
-        """Get the size of the cached values"""
+    def get_total_memory(self) -> int:
+        """Get the memory usage of the cached values in bytes"""
         if self.is_empty():
             return 0
         
         if self.content_type == CacheContentType.POST_PROJ:
-            return self.keys.numel() + self.values.numel()
+            return (self.keys.numel() + self.values.numel()) * (self.keys.element_size())
 
         else:
-            return self.hidden_states.numel()
+            return self.hidden_states.numel() * (self.hidden_states.element_size())
 
     def to(self, device: Union[str, torch.device], non_blocking: bool = False) -> None:
         """Move cache content to specified device"""
@@ -186,6 +184,367 @@ class CacheContent:
             self.values = self.values[indices, ...]
         else:
             self.hidden_states = self.hidden_states[indices, ...]
+
+
+class QuantizedCacheContent(CacheContent):
+    """
+    Extended cache content that handles quantization logic.
+    
+    This class manages:
+    - Quantized storage (always divisible by q_group_size)
+    - Residual streams (high-precision buffers)
+    - FIFO overflow strategy
+    - Quantization/dequantization operations
+    
+    Args:
+        content_type: Type of content to cache (POST_PROJ, POST_NORM, or POST_NORM_CL)
+        quantizer: Quantizer instance with quantize/dequantize/combine methods
+        nbits: Number of bits for quantization
+        axis_key: Axis for quantizing keys (or hidden states for POST_NORM)
+        axis_value: Axis for quantizing values (only used for POST_PROJ)
+        q_group_size: Group size for quantization
+        residual_length: Maximum capacity for the residual stream before FIFO overflow
+    """
+    
+    def __init__(
+        self,
+        content_type: CacheContentType,
+        quantizer: Any,
+        nbits: int,
+        axis_key: int,
+        axis_value: int,
+        q_group_size: int,
+        residual_length: int,
+    ):
+        super().__init__(content_type)
+        self.quantizer = quantizer
+        self.nbits = nbits
+        self.axis_key = axis_key
+        self.axis_value = axis_value
+        self.q_group_size = q_group_size
+        self.residual_length = residual_length
+        
+        # Quantized storage
+        if content_type == CacheContentType.POST_PROJ:
+            self._quantized_keys: Optional[tuple[torch.Tensor, dict]] = None
+            self._quantized_values: Optional[tuple[torch.Tensor, dict]] = None
+            self._quantized_length = 0  # Shared length for both keys and values
+        else:  # POST_NORM or POST_NORM_CL
+            self._quantized_hidden_states: Optional[tuple[torch.Tensor, dict]] = None
+            self._quantized_length = 0
+    
+    def initialize(self, states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]) -> Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """
+        Initialize the quantized cache with initial states.
+        Splits states into quantizable portion and residual.
+        
+        Args:
+            states: Either (key_states, value_states) tuple or hidden_states tensor
+            
+        Returns:
+            The full states (unchanged)
+        """
+        if self.content_type == CacheContentType.POST_PROJ:
+            key_states, value_states = states
+            key_total_len = key_states.shape[-2]
+            value_total_len = value_states.shape[-2]
+            
+            key_quantizable_len = (key_total_len // self.q_group_size) * self.q_group_size
+            value_quantizable_len = (value_total_len // self.q_group_size) * self.q_group_size
+            
+            # Initialize keys
+            if key_quantizable_len > 0:
+                to_quantize_keys = key_states[:, :, :key_quantizable_len, :].contiguous()
+                self._quantized_keys = self.quantizer.quantize(
+                    to_quantize_keys,
+                    axis=self.axis_key,
+                    device=key_states.device,
+                    compute_dtype=key_states.dtype,
+                    nbits=self.nbits,
+                    group_size=self.q_group_size,
+                )
+                self._prepare_metadata(self._quantized_keys, key_states.device, key_states.dtype)
+                self._quantized_length = key_quantizable_len
+            else:
+                self._quantized_keys = None
+                self._quantized_length = 0
+            
+            # Put remainder in residual stream for keys
+            if key_quantizable_len < key_total_len:
+                self.keys = key_states[:, :, key_quantizable_len:, :].contiguous()
+            else:
+                self.keys = torch.tensor([], dtype=key_states.dtype, device=key_states.device)
+            
+            # Initialize values
+            if value_quantizable_len > 0:
+                to_quantize_values = value_states[:, :, :value_quantizable_len, :].contiguous()
+                self._quantized_values = self.quantizer.quantize(
+                    to_quantize_values,
+                    axis=self.axis_value,
+                    device=value_states.device,
+                    compute_dtype=value_states.dtype,
+                    nbits=self.nbits,
+                    group_size=self.q_group_size,
+                )
+                self._prepare_metadata(self._quantized_values, value_states.device, value_states.dtype)
+            else:
+                self._quantized_values = None
+            
+            # Put remainder in residual stream for values
+            if value_quantizable_len < value_total_len:
+                self.values = value_states[:, :, value_quantizable_len:, :].contiguous()
+            else:
+                self.values = torch.tensor([], dtype=value_states.dtype, device=value_states.device)
+            
+            return key_states, value_states
+            
+        else:  # POST_NORM or POST_NORM_CL
+            total_len = states.shape[-2]
+            quantizable_len = (total_len // self.q_group_size) * self.q_group_size
+            
+            if quantizable_len > 0:
+                to_quantize = states[:, :quantizable_len, :].contiguous()
+                self._quantized_hidden_states = self.quantizer.quantize(
+                    to_quantize,
+                    axis=self.axis_key,
+                    device=states.device,
+                    compute_dtype=states.dtype,
+                    nbits=self.nbits,
+                    group_size=self.q_group_size,
+                )
+                self._prepare_metadata(self._quantized_hidden_states, states.device, states.dtype)
+                self._quantized_length = quantizable_len
+            else:
+                self._quantized_hidden_states = None
+                self._quantized_length = 0
+            
+            # Put remainder in residual stream
+            if quantizable_len < total_len:
+                self.hidden_states = states[:, quantizable_len:, :].contiguous()
+            else:
+                self.hidden_states = torch.tensor([], dtype=states.dtype, device=states.device)
+            
+            return states
+    
+    def _prepare_metadata(self, qtensor: tuple[torch.Tensor, dict], device: torch.device, dtype: torch.dtype) -> None:
+        """Prepare metadata after quantization."""
+        _, meta = qtensor
+        meta["compute_dtype"] = dtype
+        if hasattr(self.quantizer, 'cuda'):
+            self.quantizer.cuda(qtensor[0], meta=meta, device=device)
+        meta["scale"] = meta["scale"].to(device)
+        meta["zero"] = meta["zero"].to(device)
+    
+    def update(
+        self,
+        states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]
+    ) -> Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """
+        Update the cache with new states using FIFO strategy.
+        
+        Args:
+            states: Either (key_states, value_states) tuple or hidden_states tensor
+            
+        Returns:
+            Full states (quantized + residual)
+        """
+        if self.content_type == CacheContentType.POST_PROJ:
+            return self._update_post_proj(states)
+        else:
+            return self._update_post_norm(states)
+    
+    def _update_post_proj(
+        self,
+        states: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Update POST_PROJ cache with separate KV streams."""
+        key_states, value_states = states
+        
+        # Process keys
+        self.keys = torch.cat([self.keys, key_states], dim=-2)
+        keys_residual_len = self.keys.shape[-2]
+        
+        # Check if keys residual stream needs to be flushed
+        if keys_residual_len >= self.residual_length:
+            # Remove q_group_size elements from the front (FIFO)
+            keys_to_quantize = self.keys[:, :, :self.q_group_size, :].contiguous()
+            self.keys = self.keys[:, :, self.q_group_size:, :]
+            
+            # Quantize the removed group
+            new_quantized_keys = self.quantizer.quantize(
+                keys_to_quantize,
+                axis=self.axis_key,
+                device=keys_to_quantize.device,
+                compute_dtype=keys_to_quantize.dtype,
+                nbits=self.nbits,
+                group_size=self.q_group_size,
+            )
+            self._prepare_metadata(new_quantized_keys, keys_to_quantize.device, keys_to_quantize.dtype)
+            
+            # Append to quantized storage
+            if self._quantized_keys is None:
+                self._quantized_keys = new_quantized_keys
+            else:
+                self._quantized_keys = self._combine_quantized(
+                    self._quantized_keys,
+                    new_quantized_keys
+                )
+            
+            self._quantized_length += self.q_group_size
+        
+        # Process values
+        self.values = torch.cat([self.values, value_states], dim=-2)
+        values_residual_len = self.values.shape[-2]
+        
+        # Check if values residual stream needs to be flushed
+        if values_residual_len >= self.residual_length:
+            # Remove q_group_size elements from the front (FIFO)
+            values_to_quantize = self.values[:, :, :self.q_group_size, :].contiguous()
+            self.values = self.values[:, :, self.q_group_size:, :]
+            
+            # Quantize the removed group
+            new_quantized_values = self.quantizer.quantize(
+                values_to_quantize,
+                axis=self.axis_value,
+                device=values_to_quantize.device,
+                compute_dtype=values_to_quantize.dtype,
+                nbits=self.nbits,
+                group_size=self.q_group_size,
+            )
+            self._prepare_metadata(new_quantized_values, values_to_quantize.device, values_to_quantize.dtype)
+            
+            # Append to quantized storage
+            if self._quantized_values is None:
+                self._quantized_values = new_quantized_values
+            else:
+                self._quantized_values = self._combine_quantized(
+                    self._quantized_values,
+                    new_quantized_values
+                )
+        
+        # Return full sequences: quantized + residual for both keys and values
+        if self._quantized_keys is None:
+            keys_to_return = self.keys
+        else:
+            dequant_keys = self.quantizer.dequantize(self._quantized_keys[0], self._quantized_keys[1])
+            keys_to_return = torch.cat([dequant_keys, self.keys], dim=-2)
+        
+        if self._quantized_values is None:
+            values_to_return = self.values
+        else:
+            dequant_values = self.quantizer.dequantize(self._quantized_values[0], self._quantized_values[1])
+            values_to_return = torch.cat([dequant_values, self.values], dim=-2)
+        
+        return keys_to_return, values_to_return
+    
+    def _update_post_norm(self, states: torch.Tensor) -> torch.Tensor:
+        """Update POST_NORM cache."""
+        # Add new states to residual stream
+        self.hidden_states = torch.cat([self.hidden_states, states], dim=-2)
+        residual_len = self.hidden_states.shape[-2]
+        
+        # Check if residual stream needs to be flushed
+        if residual_len >= self.residual_length:
+            # Remove q_group_size elements from the front (FIFO)
+            to_quantize = self.hidden_states[:, :self.q_group_size, :].contiguous()
+            self.hidden_states = self.hidden_states[:, self.q_group_size:, :]
+            
+            # Quantize the removed group
+            new_quantized = self.quantizer.quantize(
+                to_quantize,
+                axis=self.axis_key,
+                device=to_quantize.device,
+                compute_dtype=to_quantize.dtype,
+                nbits=self.nbits,
+                group_size=self.q_group_size,
+            )
+            self._prepare_metadata(new_quantized, to_quantize.device, to_quantize.dtype)
+            
+            # Append to quantized storage
+            if self._quantized_hidden_states is None:
+                self._quantized_hidden_states = new_quantized
+            else:
+                self._quantized_hidden_states = self._combine_quantized(
+                    self._quantized_hidden_states,
+                    new_quantized
+                )
+            
+            self._quantized_length += self.q_group_size
+        
+        # Return full sequence: quantized + residual
+        if self._quantized_hidden_states is None:
+            return self.hidden_states
+        else:
+            dequant_hidden_states = self.quantizer.dequantize(
+                self._quantized_hidden_states[0],
+                self._quantized_hidden_states[1]
+            )
+            return torch.cat([dequant_hidden_states, self.hidden_states], dim=-2)
+    
+    def _combine_quantized(
+        self,
+        qtensor_main: tuple[torch.Tensor, dict],
+        qtensor_other: tuple[torch.Tensor, dict]
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        Combine two quantized tensors by concatenating quantized data and metadata.
+        
+        Args:
+            qtensor_main: First quantized tensor (qtensor, meta) tuple
+            qtensor_other: Second quantized tensor (qtensor, meta) tuple
+            
+        Returns:
+            Combined quantized tensor (qtensor, meta) tuple
+        """
+        q1, meta1 = qtensor_main
+        q2, meta2 = qtensor_other
+        
+        assert meta1["axis"] == meta2["axis"], "Quantization axes must match"
+        axis = meta1["axis"]
+        
+        # Concatenate the quantized tensors along the sequence dimension (-2)
+        combined_q = torch.cat([q1, q2], dim=-2)
+        
+        # Combine metadata
+        combined_meta = {}
+        combined_meta["axis"] = meta1["axis"]
+        combined_meta["compute_dtype"] = meta1["compute_dtype"]
+        
+        # Concatenate scale and zero tensors along the appropriate dimension
+        if axis == 0:
+            combined_meta["scale"] = torch.cat([meta1["scale"], meta2["scale"]], dim=0)
+            combined_meta["zero"] = torch.cat([meta1["zero"], meta2["zero"]], dim=0)
+        else:
+            combined_meta["scale"] = torch.cat([meta1["scale"], meta2["scale"]], dim=-1)
+            combined_meta["zero"] = torch.cat([meta1["zero"], meta2["zero"]], dim=-1)
+        
+        # Copy other metadata fields
+        for key in meta1:
+            if key not in combined_meta:
+                combined_meta[key] = meta1[key]
+        
+        return combined_q, combined_meta
+    
+    def get_quantized_length(self) -> int:
+        """Get the length of quantized storage."""
+        return self._quantized_length
+
+    def get_total_memory(self) -> int:
+        """Get the total memory including quantized and residual streams."""
+        # residual memory
+        total_memory = super().get_total_memory()
+        
+        # quantized memory (first element of the tuple is the actual tensor)
+        if self.content_type == CacheContentType.POST_PROJ:
+            if self._quantized_keys is not None:
+                total_memory += self._quantized_keys[0].numel() * self._quantized_keys[0].element_size()
+            if self._quantized_values is not None:
+                total_memory += self._quantized_values[0].numel() * self._quantized_values[0].element_size()
+        else:
+            if self._quantized_hidden_states is not None:
+                total_memory += self._quantized_hidden_states[0].numel() * self._quantized_hidden_states[0].element_size()
+        
+        return total_memory
 
 class CacheLayerMixin(ABC):
     """Base, abstract class for a single layer's cache."""
@@ -299,8 +658,8 @@ class CacheLayerMixin(ABC):
             self.content.index_select(0, beam_idx)
     
 
-    def get_total_size(self) -> int:
-        return self.content.get_total_size()
+    def get_total_memory(self) -> int:
+        return self.content.get_total_memory()
 
 
 class DynamicLayer(CacheLayerMixin):
@@ -315,7 +674,7 @@ class DynamicLayer(CacheLayerMixin):
 
     def lazy_initialization(self, states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]):
         if self.content_type == CacheContentType.POST_PROJ:
-            key_states, value_states = states
+            key_states, _ = states
             self.dtype, self.device = key_states.dtype, key_states.device
             self.content.keys = torch.tensor([], dtype=self.dtype, device=self.device)
             self.content.values = torch.tensor([], dtype=self.dtype, device=self.device)
@@ -716,18 +1075,32 @@ class StaticSlidingWindowLayer(StaticLayer):
         return self.cumulative_length
 
 
-class QuantizedLayer(DynamicLayer):
+class QuantizedLayer(CacheLayerMixin):
     """
-    A quantized layer similar to what is described in the 
+    A quantized layer is an adaptation of DynamicLayer suitable to hold quantized contentsimilar to what is described in the 
     [KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache paper](https://huggingface.co/papers/2402.02750).
     It allows the model to generate longer sequence length without allocating too much memory for the key and value caches by
     applying quantization.
 
-    The cache has two types of storage, one for original precision and one for the quantized cache. A `residual length`
-    is set as a maximum capacity for the original precision cache. When the length goes beyond maximum capacity, the original
-    precision cache is discarded and moved into the quantized cache. The quantization is done per-channel with a set `q_group_size`
-    for both Keys and Values (POST_PROJ) or hidden states (POST_NORM), in contrast to what was described in the paper.
+    The cache has two types of storage:
+    1. Quantized storage: Always divisible by q_group_size
+    2. Residual stream: High-precision buffer for recent tokens
+    
+    For POST_NORM:
+    - New tokens accumulate in the residual stream
+    - When residual stream size >= residual_length, we remove q_group_size elements (FIFO),
+      quantize them, and append to the quantized storage
+    - Quantized portion always contains complete groups (divisible by q_group_size)
+    
+    For POST_PROJ:
+    - Separate residual streams for keys and values
+    - Same FIFO strategy as POST_NORM applied independently to keys and values
+    - Each stream maintains its own quantized storage and residual buffer
+    
+    This base class is abstract - subclasses must provide a quantizer.
     """
+
+    is_sliding = False
 
     def __init__(
         self,
@@ -738,6 +1111,17 @@ class QuantizedLayer(DynamicLayer):
         residual_length: int = 128,
         content_type: CacheContentType = CacheContentType.POST_PROJ,
     ):
+        
+        # residual_length should be at least q_group_size and divisible by q_group_size
+        if residual_length < q_group_size:
+            raise ValueError(
+                f"`residual_length` ({residual_length}) should be >= `q_group_size` ({q_group_size})"
+            )
+        if residual_length % q_group_size != 0:
+            raise ValueError(
+                f"`residual_length` ({residual_length}) should be divisible by `q_group_size` ({q_group_size})"
+            )
+       
         super().__init__(content_type=content_type)
         self.nbits = nbits
         self.axis_key = axis_key
@@ -745,6 +1129,42 @@ class QuantizedLayer(DynamicLayer):
         self.q_group_size = q_group_size
         self.residual_length = residual_length
         self.cumulative_length = 0
+        
+        # Store content_type before replacing content
+        self._content_type = content_type
+        # Will be replaced with QuantizedCacheContent in lazy_initialization
+        self.content = None
+
+    @property
+    def content_type(self) -> CacheContentType:
+        """Get the content type of this cache layer"""
+        return self._content_type
+
+    @abstractmethod
+    def _get_quantizer(self):
+        """Return the quantizer to use. Subclasses must implement this."""
+        ...
+
+    def lazy_initialization(self, states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]):
+        """Initialize the quantized cache content."""
+        if self.content_type == CacheContentType.POST_PROJ:
+            key_states, _ = states
+            self.dtype, self.device = key_states.dtype, key_states.device
+        else:
+            self.dtype, self.device = states.dtype, states.device
+        
+        # Create QuantizedCacheContent with the quantizer
+        self.content = QuantizedCacheContent(
+            content_type=self.content_type,
+            quantizer=self._get_quantizer(),
+            nbits=self.nbits,
+            axis_key=self.axis_key,
+            axis_value=self.axis_value,
+            q_group_size=self.q_group_size,
+            residual_length=self.residual_length,
+        )
+        
+        self.is_initialized = True
 
     def update(
         self,
@@ -773,106 +1193,26 @@ class QuantizedLayer(DynamicLayer):
         # Lazy initialization
         if not self.is_initialized:
             self.lazy_initialization(states)
-            if self.content_type == CacheContentType.POST_PROJ:
-                self._quantized_keys = self._quantize(key_states.contiguous(), axis=self.axis_key)
-                self._quantized_values = self._quantize(value_states.contiguous(), axis=self.axis_value)
-                return key_states, value_states
-            else:  # POST_NORM or POST_NORM_CL
-                self._quantized_hidden_states = self._quantize(states.contiguous(), axis=self.axis_key)
-                return states
-
-        # Handle POST_PROJ (KV cache)
-        if self.content_type == CacheContentType.POST_PROJ:
-            dequant_keys = self._dequantize(self._quantized_keys)
-            dequant_values = self._dequantize(self._quantized_values)
-            keys_to_return = torch.cat([dequant_keys, self.keys, key_states], dim=-2)
-            values_to_return = torch.cat([dequant_values, self.values, value_states], dim=-2)
-            
-            if self.keys.dim() == 4 and self.keys.shape[-2] + 1 >= self.residual_length:
-                self._quantized_keys = self._quantize(keys_to_return.contiguous(), axis=self.axis_key)
-                self._quantized_values = self._quantize(values_to_return.contiguous(), axis=self.axis_value)
-                self.keys = torch.tensor([], dtype=key_states.dtype, device=key_states.device)
-                self.values = torch.tensor([], dtype=key_states.dtype, device=key_states.device)
-            else:
-                self.keys = torch.cat([self.keys, key_states], dim=-2)
-                self.values = torch.cat([self.values, value_states], dim=-2)
-
-            return keys_to_return, values_to_return
+            # Initialize and return
+            return self.content.initialize(states)
         
-        # Handle POST_NORM / POST_NORM_CL (hidden states cache)
-        else:
-            dequant_hidden_states = self._dequantize(self._quantized_hidden_states)
-            hidden_to_return = torch.cat([dequant_hidden_states, self.hidden_states, states], dim=-2)
-            
-            if self.hidden_states.dim() == 3 and self.hidden_states.shape[-2] + 1 >= self.residual_length:
-                self._quantized_hidden_states = self._quantize(hidden_to_return.contiguous(), axis=self.axis_key)
-                self.hidden_states = torch.tensor([], dtype=states.dtype, device=states.device)
-            else:
-                self.hidden_states = torch.cat([self.hidden_states, states], dim=-2)
+        # Delegate to content for update logic
+        return self.content.update(states)
 
-            return hidden_to_return
-
-    @abstractmethod
-    def _quantize(self, tensor, axis): ...
-
-    @abstractmethod
-    def _dequantize(self, q_tensor): ...
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        """Return the length and offset of the cache, used to generate the mask"""
+        offset = 0
+        query_length = cache_position.shape[0]
+        length = self.get_seq_length() + query_length
+        return length, offset
 
     def get_seq_length(self) -> int:
         """Returns the sequence length of the cached states."""
         return self.cumulative_length
 
-
-class QuantoQuantizedLayer(QuantizedLayer):
-    def __init__(
-        self,
-        nbits: int = 4,
-        axis_key: int = 0,
-        axis_value: int = 0,
-        q_group_size: int = 64,
-        residual_length: int = 128,
-        content_type: CacheContentType = CacheContentType.POST_PROJ,
-    ):
-        super().__init__(
-            nbits=nbits,
-            axis_key=axis_key,
-            axis_value=axis_value,
-            q_group_size=q_group_size,
-            residual_length=residual_length,
-            content_type=content_type,
-        )
-
-        # We need to import quanto here to avoid circular imports due to optimum/quanto/models/transformers_models.py
-        if is_quanto_greater("0.2.5", accept_dev=True):
-            from optimum.quanto import MaxOptimizer, qint2, qint4
-        else:
-            raise ImportError(
-                "You need optimum-quanto package version to be greater or equal than 0.2.5 to use `QuantoQuantizedCache`. "
-            )
-
-        if self.nbits not in [2, 4]:
-            raise ValueError(f"`nbits` for `quanto` backend has to be one of [`2`, `4`] but got {self.nbits}")
-
-        if self.axis_key not in [0, -1]:
-            raise ValueError(f"`axis_key` for `quanto` backend has to be one of [`0`, `-1`] but got {self.axis_key}")
-
-        if self.axis_value not in [0, -1]:
-            raise ValueError(
-                f"`axis_value` for `quanto` backend has to be one of [`0`, `-1`] but got {self.axis_value}"
-            )
-
-        self.qtype = qint4 if self.nbits == 4 else qint2
-        self.optimizer = MaxOptimizer()  # hardcode as it's the only one for per-channel quantization
-
-    def _quantize(self, tensor, axis):
-        from optimum.quanto import quantize_weight
-
-        scale, zeropoint = self.optimizer(tensor, self.qtype, axis, self.q_group_size)
-        qtensor = quantize_weight(tensor, self.qtype, axis, scale, zeropoint, self.q_group_size)
-        return qtensor
-
-    def _dequantize(self, qtensor):
-        return qtensor.dequantize()
+    def get_max_cache_shape(self) -> int:
+        """Returns the maximum sequence length of the cache object."""
+        return -1
 
 
 class QuantizedLayerWithQuantizer(QuantizedLayer):
@@ -894,12 +1234,16 @@ class QuantizedLayerWithQuantizer(QuantizedLayer):
         self,
         quantizer,
         nbits: int = 4,
-        axis_key: int = 0,
-        axis_value: int = 0,
+        axis: Union[int, Tuple[int, int]] = 0,
         q_group_size: int = 64,
         residual_length: int = 128,
         content_type: CacheContentType = CacheContentType.POST_PROJ,
     ):
+        if isinstance(axis, int):
+            axis_key = axis
+            axis_value = axis
+        else:
+            axis_key, axis_value = axis
         super().__init__(
             nbits=nbits,
             axis_key=axis_key,
@@ -910,29 +1254,11 @@ class QuantizedLayerWithQuantizer(QuantizedLayer):
         )
         if quantizer is None:
             raise ValueError("`quantizer` cannot be None for `QuantizedLayerWithQuantizer`")
-        self.quantizer = quantizer
+        self.quantizer_class = quantizer
 
-    def _quantize(self, tensor, axis):
-        qtensor, meta = self.quantizer.quantize(
-            tensor,
-            axis=axis,
-            device=self.keys.device if self.keys is not None else self.hidden_states.device,
-            compute_dtype=self.keys.dtype if self.keys is not None else self.hidden_states.dtype,
-            nbits=self.nbits,
-            group_size=self.q_group_size,
-        )
-        device = self.keys.device if self.keys is not None else self.hidden_states.device
-        dtype = self.keys.dtype if self.keys is not None else self.hidden_states.dtype
-        meta["compute_dtype"] = dtype
-        self.quantizer.cuda(qtensor, meta=meta, device=device)  # Move to device and cast to dtype
-        meta["scale"] = meta["scale"].to(qtensor.device)
-        meta["zero"] = meta["zero"].to(qtensor.device)
-        return qtensor, meta
-
-    def _dequantize(self, qtensor):
-        quant_tensor, meta = qtensor
-        tensor = self.quantizer.dequantize(quant_tensor, meta)
-        return tensor
+    def _get_quantizer(self):
+        """Return the quantizer instance."""
+        return self.quantizer_class
 
 
 class HQQQuantizedLayer(QuantizedLayerWithQuantizer):
@@ -969,6 +1295,86 @@ class HQQQuantizedLayer(QuantizedLayerWithQuantizer):
             nbits=nbits,
             axis_key=axis_key,
             axis_value=axis_value,
+            q_group_size=q_group_size,
+            residual_length=residual_length,
+            content_type=content_type,
+        )
+
+
+class QuantoQuantizer:
+    """Wrapper for Quanto quantization to match the expected quantizer interface."""
+    
+    def __init__(self, optimizer, qtype, q_group_size):
+        self.optimizer = optimizer
+        self.qtype = qtype
+        self.q_group_size = q_group_size
+    
+    def quantize(self, tensor, axis, device, compute_dtype, nbits, group_size):
+        """Quantize a tensor using Quanto."""
+        from optimum.quanto import quantize_weight
+        
+        scale, zeropoint = self.optimizer(tensor, self.qtype, axis, self.q_group_size)
+        qtensor = quantize_weight(tensor, self.qtype, axis, scale, zeropoint, self.q_group_size)
+        
+        # Return (qtensor, metadata) tuple
+        meta = {
+            "axis": axis,
+            "scale": scale,
+            "zero": zeropoint,
+            "compute_dtype": compute_dtype,
+        }
+        return qtensor, meta
+    
+    def dequantize(self, qtensor, meta):
+        """Dequantize a tensor using Quanto."""
+        return qtensor.dequantize()
+
+
+class QuantoQuantizedLayer(QuantizedLayerWithQuantizer):
+    """
+    A quantized layer using the Quanto backend.
+    This is a convenience wrapper around QuantizedLayerWithQuantizer that uses QuantoQuantizer.
+    """
+    
+    def __init__(
+        self,
+        nbits: int = 4,
+        axis_key: int = 0,
+        axis_value: int = 0,
+        q_group_size: int = 64,
+        residual_length: int = 128,
+        content_type: CacheContentType = CacheContentType.POST_PROJ,
+    ):
+        # Validate parameters before calling super().__init__()
+        if nbits not in [2, 4]:
+            raise ValueError(f"`nbits` for `quanto` backend has to be one of [`2`, `4`] but got {nbits}")
+
+        if axis_key not in [0, -1]:
+            raise ValueError(f"`axis_key` for `quanto` backend has to be one of [`0`, `-1`] but got {axis_key}")
+
+        if axis_value not in [0, -1]:
+            raise ValueError(
+                f"`axis_value` for `quanto` backend has to be one of [`0`, `-1`] but got {axis_value}"
+            )
+        
+        # We need to import quanto here to avoid circular imports due to optimum/quanto/models/transformers_models.py
+        if is_quanto_greater("0.2.5", accept_dev=True):
+            from optimum.quanto import MaxOptimizer, qint2, qint4
+        else:
+            raise ImportError(
+                "You need optimum-quanto package version to be greater or equal than 0.2.5 to use `QuantoQuantizedCache`. "
+            )
+
+        qtype = qint4 if nbits == 4 else qint2
+        optimizer = MaxOptimizer()  # hardcode as it's the only one for per-channel quantization
+        
+        # Create the quantizer and pass it to parent
+        quantizer = QuantoQuantizer(optimizer, qtype, q_group_size)
+        
+        super().__init__(
+            quantizer=quantizer,
+            nbits=nbits,
+            axis=(axis_key, axis_value),
             q_group_size=q_group_size,
             residual_length=residual_length,
             content_type=content_type,
@@ -1138,10 +1544,10 @@ class Cache:
             return -1
         return self.layers[layer_idx].get_max_cache_shape()
 
-    def get_total_size(self, layer_idx: int = 0):
+    def get_total_memory(self, layer_idx: int = 0):
         if layer_idx >= len(self.layers):
             return 0
-        return self.layers[layer_idx].get_total_size()
+        return self.layers[layer_idx].get_total_memory()
 
     def reset(self):
         """Recursively reset all layers tensors"""
@@ -1522,7 +1928,7 @@ class QuantizedCache(Cache):
         elif backend == "hqq":
             layer_class = HQQQuantizedLayer
         elif backend == "custom":
-            layer_class = QuantizedLayerwithQuantizer
+            layer_class = QuantizedLayerWithQuantizer
         else:
             raise ValueError(f"Unknown quantization backend `{backend}`")
 
