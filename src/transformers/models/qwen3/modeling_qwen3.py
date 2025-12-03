@@ -287,7 +287,8 @@ class Qwen3Attention(nn.Module):
         cos, sin = position_embeddings
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        
+        is_eager = self.config._attn_implementation == "eager"
+
         # the branch corresponding to standard KV-cache
         if past_key_values is None or past_key_values.content_type == "post_proj":
 
@@ -312,9 +313,24 @@ class Qwen3Attention(nn.Module):
                 full_cos, full_sin = None, None  # no need to extend
                 full_hidden_shape = hidden_shape
             else:
-                full_cache_position = torch.arange(0, full_hidden_states.shape[1], device=full_hidden_states.device
-                                                   ).unsqueeze(0)
-                full_cos, full_sin = self.rotary_emb(full_hidden_states, full_cache_position)
+                # recreate position_ids for RoPE calculation
+                # covert attention_mask to position_ids: covert to 2D -> invert to 0,1 mask
+                if attention_mask is None: # most likely case: delegating the causal mask creation to sdpa
+                    # create a attention mask full of ones
+                    attention_mask_2d = torch.ones(full_hidden_states.shape[:-1], dtype=torch.long, device=full_hidden_states.device)
+                else:
+                    attention_mask_2d = torch.squeeze(attention_mask, dim=(1, 2)).long()
+                # if it's a 0,1 mask we can process it directly
+                if not is_eager: # ((attention_mask_2d == 0) | (attention_mask_2d == 1)).all():
+                    position_ids = attention_mask_2d.cumsum(-1) - 1
+                else:
+                    # invert 0 to 1 and -inf to 0
+                    attention_mask_2d.masked_fill_(attention_mask_2d != 0, 1)
+                    attention_mask_2d = 1 - attention_mask_2d
+                    position_ids = attention_mask_2d.cumsum(-1) - 1
+                    position_ids.masked_fill_(attention_mask_2d == 0, 1)
+
+                full_cos, full_sin = self.rotary_emb(full_hidden_states, position_ids)
                 full_input_shape = full_hidden_states.shape[:-1]
                 full_hidden_shape = (*full_input_shape, -1, self.head_dim)
 
@@ -330,7 +346,7 @@ class Qwen3Attention(nn.Module):
 
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if not is_eager:
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(

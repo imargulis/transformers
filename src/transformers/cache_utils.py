@@ -228,10 +228,10 @@ class QuantizedCacheContent(CacheContent):
         if content_type == CacheContentType.POST_PROJ:
             self._quantized_keys: Optional[tuple[torch.Tensor, dict]] = None
             self._quantized_values: Optional[tuple[torch.Tensor, dict]] = None
-            self._quantized_length = 0  # Shared length for both keys and values
         else:  # POST_NORM or POST_NORM_CL
             self._quantized_hidden_states: Optional[tuple[torch.Tensor, dict]] = None
-            self._quantized_length = 0
+        
+        self._quantized_length = 0
     
     def initialize(self, states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]) -> Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """
@@ -498,25 +498,26 @@ class QuantizedCacheContent(CacheContent):
         """
         q1, meta1 = qtensor_main
         q2, meta2 = qtensor_other
-        
+        # several sanity checks
+        assert q1.dtype == q2.dtype, "Quantized tensor dtypes must match"
+        assert meta1["compute_dtype"] == meta2["compute_dtype"], "Compute dtypes must match"
+        assert meta1["nbits"] == meta2["nbits"], "Number of bits must match"
+        assert meta1["group_size"] == meta2["group_size"], "Group sizes must match"
         assert meta1["axis"] == meta2["axis"], "Quantization axes must match"
+        
         axis = meta1["axis"]
         
-        # Concatenate the quantized tensors along the sequence dimension (-2)
-        combined_q = torch.cat([q1, q2], dim=-2)
-        
+        # Concatenate the quantized tensors along the sequence dimension
+        # Determine the dimension to concatenate on (based on axis)
+        combined_q = torch.cat([q1, q2], dim=-1-axis)
+
         # Combine metadata
         combined_meta = {}
-        combined_meta["axis"] = meta1["axis"]
-        combined_meta["compute_dtype"] = meta1["compute_dtype"]
+        combined_meta['orig_dim'] = meta1['orig_dim'] + meta2['orig_dim']
         
         # Concatenate scale and zero tensors along the appropriate dimension
-        if axis == 0:
-            combined_meta["scale"] = torch.cat([meta1["scale"], meta2["scale"]], dim=0)
-            combined_meta["zero"] = torch.cat([meta1["zero"], meta2["zero"]], dim=0)
-        else:
-            combined_meta["scale"] = torch.cat([meta1["scale"], meta2["scale"]], dim=-1)
-            combined_meta["zero"] = torch.cat([meta1["zero"], meta2["zero"]], dim=-1)
+        combined_meta["scale"] = torch.cat([meta1["scale"], meta2["scale"]], dim=-2-axis)
+        combined_meta["zero"] = torch.cat([meta1["zero"], meta2["zero"]], dim=-2-axis)
         
         # Copy other metadata fields
         for key in meta1:
@@ -1254,7 +1255,10 @@ class QuantizedLayerWithQuantizer(QuantizedLayer):
         )
         if quantizer is None:
             raise ValueError("`quantizer` cannot be None for `QuantizedLayerWithQuantizer`")
-        self.quantizer_class = quantizer
+        if isinstance(quantizer, str):
+            self.quantizer_class = None # TODO: implement string to class mapping for registered quantizers
+        else:
+            self.quantizer_class = quantizer
 
     def _get_quantizer(self):
         """Return the quantizer instance."""
@@ -1293,8 +1297,7 @@ class HQQQuantizedLayer(QuantizedLayerWithQuantizer):
         super().__init__(
             quantizer=HQQQuantizer,
             nbits=nbits,
-            axis_key=axis_key,
-            axis_value=axis_value,
+            axis=(axis_key, axis_value),
             q_group_size=q_group_size,
             residual_length=residual_length,
             content_type=content_type,
@@ -1939,7 +1942,7 @@ class QuantizedCache(Cache):
         # Create layers with or without quantizer parameter depending on backend
         if backend == "custom":
             layers = [
-                layer_class(nbits, axis_key, axis_value, q_group_size, residual_length, content_type, quantizer=quantizer)
+                layer_class(quantizer, nbits, (axis_key, axis_value), q_group_size, residual_length, content_type)
                 for _ in range(config.num_hidden_layers)
             ]
         else:
@@ -2108,7 +2111,6 @@ class EncoderDecoderCache(Cache):
 
 
 ### Deprecated classes
-
 
 class SlidingWindowLayer(StaticSlidingWindowLayer):
     def __init__(self, max_cache_len: int, sliding_window: int):
