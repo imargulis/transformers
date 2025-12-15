@@ -163,11 +163,33 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    q_embed = apply_rotary_pos_emb_single(q, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+    k_embed = apply_rotary_pos_emb_single(k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+    return q_embed, k_embed
+
+def apply_rotary_pos_emb_single(t, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to a single tensor.
+
+    Args:
+        t (`torch.Tensor`): The input tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `torch.Tensor` rotated using the Rotary Position Embedding.
+    """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    embed = (t * cos) + (rotate_half(t) * sin)
+    return embed
 
 
 class LlamaMLP(nn.Module):
@@ -228,10 +250,11 @@ def eager_attention_forward(
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig, layer_idx: int, rotary_emb: Optional[nn.Module] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.rotary_emb = rotary_emb
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
@@ -251,6 +274,81 @@ class LlamaAttention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
 
+        # For post_norm caching with low-rank adaptation
+        self.k_proj_up = None
+        self.k_proj_down = None
+        self.v_proj_up = None
+        self.v_proj_down = None
+
+    def _split_linear(self, linear: nn.Linear) -> tuple[nn.Linear, nn.Linear]:
+        """
+        Factor a Linear layer into two Linear layers using SVD.
+        L: R^n -> R^m  with weight W (m x n)
+        We build L2: R^n -> R^k, L1: R^k -> R^m so that
+        W ≈ W1 @ W2
+        where:
+            W = U Σ V^T            (SVD)
+            W1 = U Σ               (m x k)
+            W2 = V^T               (k x n)
+        
+        Args:
+            linear_layer (`nn.Linear`): The linear layer L to split.
+
+        Returns:
+            A tuple of two `nn.Linear` layers (L_up, L_down), such that the output of L(x)=L_up(L_down(x)) for any input x.
+        """
+        m = linear.out_features
+        n = linear.in_features
+
+        with torch.no_grad():
+            W = linear.weight.data  # shape (m, n)
+            device = W.device
+            dtype = W.dtype
+
+            # economic SVD
+            # U: (m, r), S: (r,), Vh: (r, n); r = min(m, n)
+            # upscale W to float32 as SVD is not available in half precision
+            U, S, V = torch.linalg.svd(W.float(), full_matrices=False)
+
+            # Optionally truncate rank
+            r = S.shape[0] 
+            U = U[:, :r] # (m, r)
+            V = V[:r, :] # (r, n)
+
+            # Build L2 input -> rank
+            L2 = nn.Linear(in_features=n, out_features=r, bias=False, device=device, dtype=dtype)
+            # Build L1: rank -> output
+            L1 = nn.Linear(in_features=r, out_features=m, bias=linear.bias is not None, device=device, dtype=dtype)
+        
+            # W1 = U @ diag(S)  (m x r)
+            W1 = U @ torch.diag(S)
+            # W2 = V          (r x n)
+
+            # make sure new layers and old layer have same device and dtype as the original linear layer   
+            L1.weight.copy_(W1.to(dtype))
+            L2.weight.copy_(V.to(dtype))
+            # Keep the original bias in the outer layer
+            if linear.bias is not None:
+                L1.bias.copy_(linear.bias)
+
+        return L1, L2
+
+    def _get_rope_config(self, tensor_for_device, seq_len, attention_mask, is_eager):
+        if attention_mask is None:
+            attention_mask_2d = torch.ones((tensor_for_device.shape[0], seq_len), dtype=torch.long, device=tensor_for_device.device)
+        else:
+            attention_mask_2d = torch.squeeze(attention_mask, dim=(1, 2)).long()
+            
+        if not is_eager:
+            position_ids = attention_mask_2d.cumsum(-1) - 1
+        else:
+            attention_mask_2d.masked_fill_(attention_mask_2d != 0, 1)
+            attention_mask_2d = 1 - attention_mask_2d
+            position_ids = attention_mask_2d.cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask_2d == 0, 1)
+            
+        return self.rotary_emb(tensor_for_device, position_ids)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -262,18 +360,92 @@ class LlamaAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        is_eager = self.config._attn_implementation == "eager"
 
-        if past_key_values is not None:
+        if past_key_values is None or past_key_values.content_type == "post_proj":
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+            query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
+
+            cache_prerope = getattr(self.config, "cache_prerope", False)
+
+            if not cache_prerope:
+                key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
+
+            if past_key_values is not None:
+                # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_values.update((key_states, value_states), self.layer_idx, cache_kwargs)
+
+            if cache_prerope:
+                # If we are in prefill (seq_len == cache_position.shape[0]), cos/sin are already correct for the full sequence.
+                # If we are in decoding (seq_len > cache_position.shape[0]), we need to generate full_cos/full_sin for the full cached sequence.
+                seq_len = key_states.shape[2]
+                if seq_len == cache_position.shape[0]:
+                    key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
+                else:
+                    # Decoding with cache_prerope=True. 
+                    # key_states contains [past_keys, new_keys] (unrotated).
+                    # We need to rotate the whole thing.
+                    
+                    full_cos, full_sin = self._get_rope_config(key_states, seq_len, attention_mask, is_eager)
+                    key_states = apply_rotary_pos_emb_single(key_states, full_cos, full_sin)
+
+        elif past_key_values is not None and past_key_values.content_type != "post_proj":
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            if past_key_values.content_paired:
+                if (self.k_proj_down is None):
+                    # TODO: should be done on post_init after the original weights are loaded
+                    self.k_proj_up, self.k_proj_down = self._split_linear(self.k_proj)
+                    self.v_proj_up, self.v_proj_down = self._split_linear(self.v_proj)
+                # low-rank k/v projection case
+                k_proj_hidden_states = self.k_proj_down(hidden_states)
+                v_proj_hidden_states = self.v_proj_down(hidden_states)
+                key_states, value_states = past_key_values.update((k_proj_hidden_states, v_proj_hidden_states), self.layer_idx, cache_kwargs)
+
+                # prefill stage
+                if key_states.shape[1] == cache_position.shape[0]:
+                    full_cos, full_sin = None, None  # no need to extend
+                    full_hidden_shape = hidden_shape
+                else:
+                    full_cos, full_sin = self._get_rope_config(key_states, key_states.shape[1], attention_mask, is_eager)
+                    full_input_shape = key_states.shape[:-1]
+                    full_hidden_shape = (*full_input_shape, -1, self.head_dim)
+
+                query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                key_states = self.k_proj_up(key_states).view(full_hidden_shape).transpose(1, 2)
+                value_states = self.v_proj_up(value_states).view(full_hidden_shape).transpose(1, 2)
+
+                query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
+                if full_cos is not None:
+                    key_states = apply_rotary_pos_emb_single(key_states, full_cos, full_sin)
+                else:
+                    key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
+            else:
+                full_hidden_states = past_key_values.update(hidden_states, self.layer_idx, cache_kwargs)
+            
+                # prefill stage
+                if full_hidden_states.shape[1] == cache_position.shape[0]:
+                    full_cos, full_sin = None, None  # no need to extend
+                    full_hidden_shape = hidden_shape
+                else:
+                    full_cos, full_sin = self._get_rope_config(full_hidden_states, full_hidden_states.shape[1], attention_mask, is_eager)
+                    full_input_shape = full_hidden_states.shape[:-1]
+                    full_hidden_shape = (*full_input_shape, -1, self.head_dim)
+
+                query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                key_states = self.k_proj(full_hidden_states).view(full_hidden_shape).transpose(1, 2)
+                value_states = self.v_proj(full_hidden_states).view(full_hidden_shape).transpose(1, 2)
+
+                query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
+                if full_cos is not None:
+                    key_states = apply_rotary_pos_emb_single(key_states, full_cos, full_sin)
+                else:
+                    key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -296,11 +468,11 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig, layer_idx: int, rotary_emb: Optional[nn.Module] = None):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx, rotary_emb=rotary_emb)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -367,12 +539,12 @@ class LlamaModel(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, layer_idx, rotary_emb=self.rotary_emb) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -397,7 +569,27 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            # read Env variable to decide whether we are simulating quantized cache
+            import os
+            is_simulating = os.getenv("SIMULATE_QUANTIZED_CACHE", "false").lower() == "true"
+            
+            # If past_key_values are None and we are simulating quantized cache, we create a dummy cache to simulate the behavior
+            if is_simulating:
+                from transformers.cache_utils import QuantizedCache
+                content_type = "post_proj"
+                # Create a temporary cache to simulate quantized cache behavior for post_norm caching
+                past_key_values = QuantizedCache(backend='custom', config=self.config, 
+                       content_type=content_type,
+                       quantizer='uq',
+                       # defaults
+                       nbits = 4,
+                       axis_key = 1,
+                       axis_value = 0,
+                       q_group_size = 64,
+                       residual_length = 128,
+                       is_simulating=is_simulating)
+            else:
+                past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0

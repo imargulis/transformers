@@ -68,6 +68,8 @@ class LlamaConfig(PreTrainedConfig):
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if `config.is_decoder=True`.
+        cache_prerope (`bool`, *optional*, defaults to `False`):
+            Whether to cache the pre-RoPE key and value tensors for potentially better quantization.
         pad_token_id (`int`, *optional*):
             Padding token id.
         bos_token_id (`int`, *optional*, defaults to 1):
@@ -138,6 +140,7 @@ class LlamaConfig(PreTrainedConfig):
         initializer_range: Optional[float] = 0.02,
         rms_norm_eps: Optional[int] = 1e-6,
         use_cache: Optional[bool] = True,
+        cache_prerope: Optional[bool] = False,
         pad_token_id: Optional[int] = None,
         bos_token_id: Optional[int] = 1,
         eos_token_id: Optional[int] = 2,
@@ -167,6 +170,7 @@ class LlamaConfig(PreTrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.pretraining_tp = pretraining_tp
         self.use_cache = use_cache
+        self.cache_prerope = cache_prerope
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.mlp_bias = mlp_bias

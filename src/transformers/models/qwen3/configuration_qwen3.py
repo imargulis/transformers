@@ -67,6 +67,8 @@ class Qwen3Config(PreTrainedConfig):
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if `config.is_decoder=True`.
+        cache_prerope (`bool`, *optional*, defaults to `False`):
+            Whether to cache the pre-RoPE key and value tensors for potentially better quantization.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether the model's input and output word embeddings should be tied.
         rope_parameters (`RopeParameters`, *optional*):
@@ -133,6 +135,7 @@ class Qwen3Config(PreTrainedConfig):
         initializer_range: Optional[float] = 0.02,
         rms_norm_eps: Optional[int] = 1e-6,
         use_cache: Optional[bool] = True,
+        cache_prerope: Optional[bool] = False,
         tie_word_embeddings: Optional[bool] = False,
         rope_parameters: Optional[RopeParameters | dict[str, RopeParameters]] = None,
         attention_bias: Optional[bool] = False,
@@ -163,6 +166,7 @@ class Qwen3Config(PreTrainedConfig):
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
+        self.cache_prerope = cache_prerope
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
 

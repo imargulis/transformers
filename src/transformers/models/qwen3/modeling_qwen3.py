@@ -267,6 +267,11 @@ class Qwen3Attention(nn.Module):
         self.v_proj = nn.Linear(
             config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
+
+        # temporary patch for spliting the k_proj/v_proj. SHoud be done in post init phase
+        self.k_proj_down, self.k_proj_up = None, None
+        self.v_proj_down, self.v_proj_up = None, None
+
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
@@ -274,6 +279,75 @@ class Qwen3Attention(nn.Module):
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
 
+    def _get_rope_config(self, tensor_for_device, seq_len, attention_mask, is_eager):
+        if attention_mask is None:
+            attention_mask_2d = torch.ones((tensor_for_device.shape[0], seq_len), dtype=torch.long, device=tensor_for_device.device)
+        else:
+            attention_mask_2d = torch.squeeze(attention_mask, dim=(1, 2)).long()
+            
+        if not is_eager:
+            position_ids = attention_mask_2d.cumsum(-1) - 1
+        else:
+            attention_mask_2d.masked_fill_(attention_mask_2d != 0, 1)
+            attention_mask_2d = 1 - attention_mask_2d
+            position_ids = attention_mask_2d.cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask_2d == 0, 1)
+            
+        return self.rotary_emb(tensor_for_device, position_ids)
+
+    def _split_linear(self, linear: nn.Linear) -> tuple[nn.Linear, nn.Linear]:
+        """
+        Factor a Linear layer into two Linear layers using SVD.
+        L: R^n -> R^m  with weight W (m x n)
+        We build L2: R^n -> R^k, L1: R^k -> R^m so that
+        W ≈ W1 @ W2
+        where:
+            W = U Σ V^T            (SVD)
+            W1 = U Σ               (m x k)
+            W2 = V^T               (k x n)
+        
+        Args:
+            linear_layer (`nn.Linear`): The linear layer L to split.
+
+        Returns:
+            A tuple of two `nn.Linear` layers (L_up, L_down), such that the output of L(x)=L_up(L_down(x)) for any input x.
+        """
+        m = linear.out_features
+        n = linear.in_features
+
+        with torch.no_grad():
+            W = linear.weight.data  # shape (m, n)
+            device = W.device
+            dtype = W.dtype
+
+            # economic SVD
+            # U: (m, r), S: (r,), Vh: (r, n); r = min(m, n)
+            # upscale W to float32 as SVD is not available in half precision
+            U, S, V = torch.linalg.svd(W.float(), full_matrices=False)
+
+            # Optionally truncate rank
+            r = S.shape[0] 
+            U = U[:, :r] # (m, r)
+            V = V[:r, :] # (r, n)
+
+            # Build L2 input -> rank
+            L2 = nn.Linear(in_features=n, out_features=r, bias=False, device=device, dtype=dtype)
+            # Build L1: rank -> output
+            L1 = nn.Linear(in_features=r, out_features=m, bias=linear.bias is not None, device=device, dtype=dtype)
+        
+            # W1 = U @ diag(S)  (m x r)
+            W1 = U @ torch.diag(S)
+            # W2 = V          (r x n)
+
+            # make sure new layers and old layer have same device and dtype as the original linear layer   
+            L1.weight.copy_(W1.to(dtype))
+            L2.weight.copy_(V.to(dtype))
+            # Keep the original bias in the outer layer
+            if linear.bias is not None:
+                L1.bias.copy_(linear.bias)
+
+        return L1, L2
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -295,54 +369,82 @@ class Qwen3Attention(nn.Module):
             query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
             key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            
+            query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
+            
+            if not self.config.cache_prerope:
+                key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
 
             if past_key_values is not None:
                 # sin and cos are specific to RoPE models; cache_position needed for the static cache
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_states, value_states = past_key_values.update((key_states, value_states), self.layer_idx, cache_kwargs)
+            
+            if self.config.cache_prerope:
+                # If we are in prefill (seq_len == cache_position.shape[0]), cos/sin are already correct for the full sequence.
+                # If we are in decoding (seq_len > cache_position.shape[0]), we need to generate full_cos/full_sin for the full cached sequence.
+                seq_len = key_states.shape[2]
+                if seq_len == cache_position.shape[0]:
+                    key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
+                else:
+                    # Decoding with cache_prerope=True. 
+                    # key_states contains [past_keys, new_keys] (unrotated).
+                    # We need to rotate the whole thing.
+                    full_cos, full_sin = self._get_rope_config(key_states, seq_len, attention_mask, is_eager)
+                    key_states = apply_rotary_pos_emb_single(key_states, full_cos, full_sin)
 
         elif past_key_values is not None and past_key_values.content_type != "post_proj":
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            full_hidden_states = past_key_values.update(hidden_states, self.layer_idx, cache_kwargs)
+            if past_key_values.content_paired:
+                if (self.k_proj_down is None):
+                    # TODO: should be done on post_init after the original weights are loaded
+                    self.k_proj_up, self.k_proj_down = self._split_linear(self.k_proj)
+                    self.v_proj_up, self.v_proj_down = self._split_linear(self.v_proj)
+                # low-rank k/v projection case
+                k_proj_hidden_states = self.k_proj_down(hidden_states)
+                v_proj_hidden_states = self.v_proj_down(hidden_states)
+                key_states, value_states = past_key_values.update((k_proj_hidden_states, v_proj_hidden_states), self.layer_idx, cache_kwargs)
+
+                # prefill stage
+                if key_states.shape[1] == cache_position.shape[0]:
+                    full_cos, full_sin = None, None  # no need to extend
+                    full_hidden_shape = hidden_shape
+                else:
+                    full_cos, full_sin = self._get_rope_config(key_states, key_states.shape[1], attention_mask, is_eager)
+                    full_input_shape = key_states.shape[:-1]
+                    full_hidden_shape = (*full_input_shape, -1, self.head_dim)
+
+                query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+                key_states = self.k_norm(self.k_proj_up(key_states).view(full_hidden_shape)).transpose(1, 2)
+                value_states = self.v_proj_up(value_states).view(full_hidden_shape).transpose(1, 2)
+
+                query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
+                if full_cos is not None:
+                    key_states = apply_rotary_pos_emb_single(key_states, full_cos, full_sin)
+                else:
+                    key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
+            else:
+                full_hidden_states = past_key_values.update(hidden_states, self.layer_idx, cache_kwargs)
             
-            # prefill stage
-            if full_hidden_states.shape[1] == cache_position.shape[0]:
-                full_cos, full_sin = None, None  # no need to extend
-                full_hidden_shape = hidden_shape
-            else:
-                # recreate position_ids for RoPE calculation
-                # covert attention_mask to position_ids: covert to 2D -> invert to 0,1 mask
-                if attention_mask is None: # most likely case: delegating the causal mask creation to sdpa
-                    # create a attention mask full of ones
-                    attention_mask_2d = torch.ones(full_hidden_states.shape[:-1], dtype=torch.long, device=full_hidden_states.device)
+                # prefill stage
+                if full_hidden_states.shape[1] == cache_position.shape[0]:
+                    full_cos, full_sin = None, None  # no need to extend
+                    full_hidden_shape = hidden_shape
                 else:
-                    attention_mask_2d = torch.squeeze(attention_mask, dim=(1, 2)).long()
-                # if it's a 0,1 mask we can process it directly
-                if not is_eager: # ((attention_mask_2d == 0) | (attention_mask_2d == 1)).all():
-                    position_ids = attention_mask_2d.cumsum(-1) - 1
+                    full_cos, full_sin = self._get_rope_config(full_hidden_states, full_hidden_states.shape[1], attention_mask, is_eager)
+                    full_input_shape = full_hidden_states.shape[:-1]
+                    full_hidden_shape = (*full_input_shape, -1, self.head_dim)
+
+                query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+                key_states = self.k_norm(self.k_proj(full_hidden_states).view(full_hidden_shape)).transpose(1, 2)
+                value_states = self.v_proj(full_hidden_states).view(full_hidden_shape).transpose(1, 2)
+
+                query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
+                if full_cos is not None:
+                    key_states = apply_rotary_pos_emb_single(key_states, full_cos, full_sin)
                 else:
-                    # invert 0 to 1 and -inf to 0
-                    attention_mask_2d.masked_fill_(attention_mask_2d != 0, 1)
-                    attention_mask_2d = 1 - attention_mask_2d
-                    position_ids = attention_mask_2d.cumsum(-1) - 1
-                    position_ids.masked_fill_(attention_mask_2d == 0, 1)
-
-                full_cos, full_sin = self.rotary_emb(full_hidden_states, position_ids)
-                full_input_shape = full_hidden_states.shape[:-1]
-                full_hidden_shape = (*full_input_shape, -1, self.head_dim)
-
-            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-            key_states = self.k_norm(self.k_proj(full_hidden_states).view(full_hidden_shape)).transpose(1, 2)
-            value_states = self.v_proj(full_hidden_states).view(full_hidden_shape).transpose(1, 2)
-
-            query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
-            if full_cos is not None:
-                key_states = apply_rotary_pos_emb_single(key_states, full_cos, full_sin)
-            else:
-                key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
+                    key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
 
 
         attention_interface: Callable = eager_attention_forward
@@ -470,7 +572,26 @@ class Qwen3Model(Qwen3PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            # read Env variable to decide whether we are simulating quantized cache
+            import os
+            is_simulating = os.getenv("SIMULATE_QUANTIZED_CACHE", "false").lower() == "true"
+            # If past_key_values are None and we are simulating quantized cache, we create a dummy cache to simulate the behavior
+            if is_simulating:
+                from transformers.cache_utils import QuantizedCache
+                content_type = "post_proj"
+                # Create a temporary cache to simulate quantized cache behavior for post_norm caching
+                past_key_values = QuantizedCache(backend='custom', config=self.config, 
+                       content_type=content_type,
+                       quantizer='uq',
+                       # defaults
+                       nbits = 2,
+                       axis_key = 0,
+                       axis_value = 1,
+                       q_group_size = 64,
+                       residual_length = 128,
+                       is_simulating=is_simulating,)
+            else:
+                past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0

@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from enum import Enum
-from typing import Any, Optional, Union, Tuple
+from typing import Any, Optional, Union, Tuple, List
+from dataclasses import dataclass
 
 import torch
 
@@ -22,7 +23,27 @@ _is_torch_greater_or_equal_than_2_7 = is_torch_greater_or_equal("2.7", accept_de
 
 
 logger = logging.get_logger(__name__)
+ 
+# Infer attention type from the model config
+def use_paired_cache(config: PreTrainedConfig) -> bool:
+    """Infer attention type from model configuration"""
 
+    n_h = config.num_attention_heads
+    n_kv = getattr(config, "num_key_value_heads", n_h)
+    use_paired_cache = (n_h // n_kv) > 1
+
+    if use_paired_cache:
+        # verify that linear transforms for K/V are down-projections
+        head_dim = getattr(config, "head_dim", None)
+        hidden_dim = getattr(config, "hidden_size", None)
+        if not head_dim or not hidden_dim:
+            logger.warning("Could not infer head_dim or hidden_size from config. Assuming paired cache.")
+            return use_paired_cache
+        if hidden_dim <= (head_dim * n_kv):
+            use_paired_cache = False
+            logger.info("Current model configuration does not result in down-projected K/V. Using non-paired cache.")
+
+    return use_paired_cache
 
 class CacheContentType(Enum):
     """Enum to specify what type of data is being cached"""
@@ -53,22 +74,23 @@ class CacheContent:
     Handles both KV pairs (POST_PROJ) and hidden states (POST_NORM/POST_NORM_CL).
     """
     
-    def __init__(self, content_type: CacheContentType):
+    def __init__(self, content_type: CacheContentType, paired: bool = True):
         """
         Args:
             content_type: Type of content this container will store
         """
         self.content_type = content_type
+        self.content_paired = True if content_type == CacheContentType.POST_PROJ else paired
         
         # Storage for different content types
-        if content_type == CacheContentType.POST_PROJ:
+        if self.content_paired: 
             self.keys: Optional[torch.Tensor] = None
             self.values: Optional[torch.Tensor] = None
-        else:  # POST_NORM or POST_NORM_CL
+        else:  # POST_NORM w/o projection
             self.hidden_states: Optional[torch.Tensor] = None
            
     def __repr__(self):
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             keys_shape = self.keys.shape if self.keys is not None else None
             values_shape = self.values.shape if self.values is not None else None
             return f"CacheContent(type={self.content_type.value}, keys={keys_shape}, values={values_shape})"
@@ -78,7 +100,7 @@ class CacheContent:
     
     def is_empty(self) -> bool:
         """Check if the cache content is empty"""
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             return self.keys is None or self.keys.numel() == 0
         else:
             return self.hidden_states is None or self.hidden_states.numel() == 0
@@ -88,21 +110,21 @@ class CacheContent:
         if self.is_empty():
             return 0
         
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             return self.keys.shape[-2]
         else:
             return self.hidden_states.shape[-2]
     
     def get_device(self) -> Optional[torch.device]:
         """Get the device of the cached content"""
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             return self.keys.device if self.keys is not None else None
         else:
             return self.hidden_states.device if self.hidden_states is not None else None
     
     def get_dtype(self) -> Optional[torch.dtype]:
         """Get the dtype of the cached content"""
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             return self.keys.dtype if self.keys is not None else None
         else:
             return self.hidden_states.dtype if self.hidden_states is not None else None
@@ -112,7 +134,7 @@ class CacheContent:
         if self.is_empty():
             return 0
         
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             return (self.keys.numel() + self.values.numel()) * (self.keys.element_size())
 
         else:
@@ -123,7 +145,7 @@ class CacheContent:
         if self.is_empty():
             return
         
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             self.keys = self.keys.to(device, non_blocking=non_blocking)
             self.values = self.values.to(device, non_blocking=non_blocking)
         else:
@@ -134,7 +156,7 @@ class CacheContent:
         if self.is_empty():
             return
         
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             self.keys.zero_()
             self.values.zero_()
         else:
@@ -146,7 +168,7 @@ class CacheContent:
         if self.is_empty():
             return
         
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             self.keys = self.keys.index_select(dim, indices.to(self.keys.device))
             self.values = self.values.index_select(dim, indices.to(self.values.device))
         else:
@@ -157,7 +179,7 @@ class CacheContent:
         if self.is_empty():
             return
         
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             self.keys = self.keys[..., :max_length, :]
             self.values = self.values[..., :max_length, :]
         else:
@@ -168,7 +190,7 @@ class CacheContent:
         if self.is_empty():
             return
         
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             self.keys = self.keys.repeat_interleave(repeats, dim=dim)
             self.values = self.values.repeat_interleave(repeats, dim=dim)
         else:
@@ -179,7 +201,7 @@ class CacheContent:
         if self.is_empty():
             return
         
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             self.keys = self.keys[indices, ...]
             self.values = self.values[indices, ...]
         else:
@@ -209,26 +231,29 @@ class QuantizedCacheContent(CacheContent):
     def __init__(
         self,
         content_type: CacheContentType,
+        paired: bool,
         quantizer: Any,
         nbits: int,
         axis_key: int,
         axis_value: int,
         q_group_size: int,
         residual_length: int,
+        is_simulating: bool = False,
     ):
-        super().__init__(content_type)
+        super().__init__(content_type, paired)
         self.quantizer = quantizer
         self.nbits = nbits
         self.axis_key = axis_key
         self.axis_value = axis_value
         self.q_group_size = q_group_size
         self.residual_length = residual_length
+        self.is_simulating = is_simulating
         
         # Quantized storage
-        if content_type == CacheContentType.POST_PROJ:
+        if paired:  # POST_PROJ for example
             self._quantized_keys: Optional[tuple[torch.Tensor, dict]] = None
             self._quantized_values: Optional[tuple[torch.Tensor, dict]] = None
-        else:  # POST_NORM or POST_NORM_CL
+        else:  # POST_NORM w/o projection
             self._quantized_hidden_states: Optional[tuple[torch.Tensor, dict]] = None
         
         self._quantized_length = 0
@@ -244,17 +269,19 @@ class QuantizedCacheContent(CacheContent):
         Returns:
             The full states (unchanged)
         """
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             key_states, value_states = states
             key_total_len = key_states.shape[-2]
             value_total_len = value_states.shape[-2]
             
             key_quantizable_len = (key_total_len // self.q_group_size) * self.q_group_size
-            value_quantizable_len = (value_total_len // self.q_group_size) * self.q_group_size
-            
+            #value_quantizable_len = (value_total_len // self.q_group_size) * self.q_group_size
+            # TODO: currently testing single key quantization. Revert back !!!
+            value_quantizable_len = max(0, value_total_len - self.residual_length)
+
             # Initialize keys
             if key_quantizable_len > 0:
-                to_quantize_keys = key_states[:, :, :key_quantizable_len, :].contiguous()
+                to_quantize_keys = key_states[..., :key_quantizable_len, :].contiguous()
                 self._quantized_keys = self.quantizer.quantize(
                     to_quantize_keys,
                     axis=self.axis_key,
@@ -271,13 +298,13 @@ class QuantizedCacheContent(CacheContent):
             
             # Put remainder in residual stream for keys
             if key_quantizable_len < key_total_len:
-                self.keys = key_states[:, :, key_quantizable_len:, :].contiguous()
+                self.keys = key_states[..., key_quantizable_len:, :].contiguous()
             else:
                 self.keys = torch.tensor([], dtype=key_states.dtype, device=key_states.device)
             
             # Initialize values
             if value_quantizable_len > 0:
-                to_quantize_values = value_states[:, :, :value_quantizable_len, :].contiguous()
+                to_quantize_values = value_states[..., :value_quantizable_len, :].contiguous()
                 self._quantized_values = self.quantizer.quantize(
                     to_quantize_values,
                     axis=self.axis_value,
@@ -292,10 +319,15 @@ class QuantizedCacheContent(CacheContent):
             
             # Put remainder in residual stream for values
             if value_quantizable_len < value_total_len:
-                self.values = value_states[:, :, value_quantizable_len:, :].contiguous()
+                self.values = value_states[..., value_quantizable_len:, :].contiguous()
             else:
                 self.values = torch.tensor([], dtype=value_states.dtype, device=value_states.device)
             
+            if self.is_simulating:
+                # reconstruct the full states from quantized + residual for simulation
+                key_states = self._get_full_stream(self._quantized_keys, self.keys)
+                value_states = self._get_full_stream(self._quantized_values, self.values)
+
             return key_states, value_states
             
         else:  # POST_NORM or POST_NORM_CL
@@ -324,6 +356,8 @@ class QuantizedCacheContent(CacheContent):
             else:
                 self.hidden_states = torch.tensor([], dtype=states.dtype, device=states.device)
             
+            if self.is_simulating:
+                states = self._get_full_stream(self._quantized_hidden_states, self.hidden_states)
             return states
     
     def _prepare_metadata(self, qtensor: tuple[torch.Tensor, dict], device: torch.device, dtype: torch.dtype) -> None:
@@ -348,12 +382,22 @@ class QuantizedCacheContent(CacheContent):
         Returns:
             Full states (quantized + residual)
         """
-        if self.content_type == CacheContentType.POST_PROJ:
-            return self._update_post_proj(states)
+        if self.content_paired:
+            return self._update_paired(states)
         else:
-            return self._update_post_norm(states)
+            return self._update_non_paired(states)
     
-    def _update_post_proj(
+    def _get_full_stream(self, quantized_stream: Optional[tuple[torch.Tensor, dict]], residual_stream: torch.Tensor) -> torch.Tensor:
+        """
+        Reconstruct the full stream from quantized and residual parts.
+        """
+        if quantized_stream is None:
+            return residual_stream
+        else:
+            dequant = self.quantizer.dequantize(quantized_stream[0], quantized_stream[1])
+            return torch.cat([dequant, residual_stream], dim=-2)
+
+    def _update_paired(
         self,
         states: tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -367,8 +411,8 @@ class QuantizedCacheContent(CacheContent):
         # Check if keys residual stream needs to be flushed
         if keys_residual_len >= self.residual_length:
             # Remove q_group_size elements from the front (FIFO)
-            keys_to_quantize = self.keys[:, :, :self.q_group_size, :].contiguous()
-            self.keys = self.keys[:, :, self.q_group_size:, :]
+            keys_to_quantize = self.keys[..., :self.q_group_size, :].contiguous()
+            self.keys = self.keys[..., self.q_group_size:, :]
             
             # Quantize the removed group
             new_quantized_keys = self.quantizer.quantize(
@@ -398,9 +442,12 @@ class QuantizedCacheContent(CacheContent):
         
         # Check if values residual stream needs to be flushed
         if values_residual_len >= self.residual_length:
-            # Remove q_group_size elements from the front (FIFO)
-            values_to_quantize = self.values[:, :, :self.q_group_size, :].contiguous()
-            self.values = self.values[:, :, self.q_group_size:, :]
+            # Remove q_group_size elements from the front (FIFO) 
+            # values_to_quantize = self.values[..., :self.q_group_size, :].contiguous()
+            # self.values = self.values[..., self.q_group_size:, :]
+            # !!!! TODO: currently testing single key FIFO (token axis only is valid.) Revert back !!!
+            values_to_quantize = self.values[..., :1, :].contiguous()
+            self.values = self.values[..., 1:, :]
             
             # Quantize the removed group
             new_quantized_values = self.quantizer.quantize(
@@ -423,21 +470,12 @@ class QuantizedCacheContent(CacheContent):
                 )
         
         # Return full sequences: quantized + residual for both keys and values
-        if self._quantized_keys is None:
-            keys_to_return = self.keys
-        else:
-            dequant_keys = self.quantizer.dequantize(self._quantized_keys[0], self._quantized_keys[1])
-            keys_to_return = torch.cat([dequant_keys, self.keys], dim=-2)
-        
-        if self._quantized_values is None:
-            values_to_return = self.values
-        else:
-            dequant_values = self.quantizer.dequantize(self._quantized_values[0], self._quantized_values[1])
-            values_to_return = torch.cat([dequant_values, self.values], dim=-2)
+        keys_to_return = self._get_full_stream(self._quantized_keys, self.keys)
+        values_to_return = self._get_full_stream(self._quantized_values, self.values)
         
         return keys_to_return, values_to_return
     
-    def _update_post_norm(self, states: torch.Tensor) -> torch.Tensor:
+    def _update_non_paired(self, states: torch.Tensor) -> torch.Tensor:
         """Update POST_NORM cache."""
         # Add new states to residual stream
         self.hidden_states = torch.cat([self.hidden_states, states], dim=-2)
@@ -472,14 +510,7 @@ class QuantizedCacheContent(CacheContent):
             self._quantized_length += self.q_group_size
         
         # Return full sequence: quantized + residual
-        if self._quantized_hidden_states is None:
-            return self.hidden_states
-        else:
-            dequant_hidden_states = self.quantizer.dequantize(
-                self._quantized_hidden_states[0],
-                self._quantized_hidden_states[1]
-            )
-            return torch.cat([dequant_hidden_states, self.hidden_states], dim=-2)
+        return self._get_full_stream(self._quantized_hidden_states, self.hidden_states)
     
     def _combine_quantized(
         self,
@@ -536,7 +567,7 @@ class QuantizedCacheContent(CacheContent):
         total_memory = super().get_total_memory()
         
         # quantized memory (first element of the tuple is the actual tensor)
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             if self._quantized_keys is not None:
                 total_memory += self._quantized_keys[0].numel() * self._quantized_keys[0].element_size()
             if self._quantized_values is not None:
@@ -552,12 +583,12 @@ class CacheLayerMixin(ABC):
 
     is_compileable = False
 
-    def __init__(self, content_type: CacheContentType = CacheContentType.POST_PROJ):
+    def __init__(self, content_type: CacheContentType = CacheContentType.POST_PROJ, paired: bool = True):
         """
         Args:
             content_type: Type of content this cache layer will store
         """
-        self.content = CacheContent(content_type)
+        self.content = CacheContent(content_type, paired)
         self.is_initialized = False
 
     def __repr__(self):
@@ -567,45 +598,49 @@ class CacheLayerMixin(ABC):
     def content_type(self) -> CacheContentType:
         """Get the content type of this cache layer"""
         return self.content.content_type
+    @property
+    def content_paired(self) -> bool:
+        """Check if the content is paired (KV or similar)"""
+        return self.content.content_paired
     
     # Backward compatibility properties
     @property
     def keys(self) -> Optional[torch.Tensor]:
         """Access keys for POST_PROJ cache type"""
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             return self.content.keys
         return None
     
     @keys.setter
     def keys(self, value: Optional[torch.Tensor]) -> None:
         """Set keys for POST_PROJ cache type"""
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             self.content.keys = value
     
     @property
     def values(self) -> Optional[torch.Tensor]:
         """Access values for POST_PROJ cache type"""
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             return self.content.values
         return None
     
     @values.setter
     def values(self, value: Optional[torch.Tensor]) -> None:
         """Set values for POST_PROJ cache type"""
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             self.content.values = value
     
     @property
     def hidden_states(self) -> Optional[torch.Tensor]:
         """Access hidden states for POST_NORM/POST_NORM_CL cache types"""
-        if self.content_type != CacheContentType.POST_PROJ:
+        if not self.content_paired:
             return self.content.hidden_states
         return None
     
     @hidden_states.setter
     def hidden_states(self, value: Optional[torch.Tensor]) -> None:
         """Set hidden states for POST_NORM/POST_NORM_CL cache types"""
-        if self.content_type != CacheContentType.POST_PROJ:
+        if not self.content_paired:
             self.content.hidden_states = value
 
     @abstractmethod
@@ -670,11 +705,11 @@ class DynamicLayer(CacheLayerMixin):
 
     is_sliding = False
 
-    def __init__(self, content_type: CacheContentType = CacheContentType.POST_PROJ):
-        super().__init__(content_type)
+    def __init__(self, content_type: CacheContentType = CacheContentType.POST_PROJ, paired: bool = True):
+        super().__init__(content_type, paired)
 
     def lazy_initialization(self, states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]):
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             key_states, _ = states
             self.dtype, self.device = key_states.dtype, key_states.device
             self.content.keys = torch.tensor([], dtype=self.dtype, device=self.device)
@@ -704,12 +739,12 @@ class DynamicLayer(CacheLayerMixin):
         if not self.is_initialized:
             self.lazy_initialization(states)
 
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:  # POST_PROJ/POST_NORM with projection
             key_states, value_states = states
             self.content.keys = torch.cat([self.content.keys, key_states], dim=-2)
             self.content.values = torch.cat([self.content.values, value_states], dim=-2)
             return self.content.keys, self.content.values
-        else:  # POST_NORM or POST_NORM_CL
+        else:  # POST_NORM w/o projection
             self.content.hidden_states = torch.cat([self.content.hidden_states, states], dim=-2)
             return self.content.hidden_states
 
@@ -791,7 +826,7 @@ class DynamicSlidingWindowLayer(DynamicLayer):
         self.cumulative_length += states[0].shape[-2]
 
         # Compute the full states
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:  # POST_PROJ/POST_NORM with projection
             key_states, value_states = states
             full_key_states = torch.cat([self.keys, key_states], dim=-2)
             full_value_states = torch.cat([self.values, value_states], dim=-2)
@@ -799,7 +834,7 @@ class DynamicSlidingWindowLayer(DynamicLayer):
             # Only cache the last `self.sliding_window - 1` tokens (or all of them if lower than that)
             self.keys = full_key_states[:, :, -self.sliding_window + 1 :, :]
             self.values = full_value_states[:, :, -self.sliding_window + 1 :, :]
-        else:  # POST_NORM or POST_NORM_CL
+        else:  # POST_NORM w/o projection
             full_hidden_states = torch.cat([self.hidden_states, states], dim=-2)
             states = full_hidden_states
             self.hidden_states = full_hidden_states[:, -self.sliding_window + 1 :, :]
@@ -1075,6 +1110,366 @@ class StaticSlidingWindowLayer(StaticLayer):
         """Returns the sequence length of the cached states."""
         return self.cumulative_length
 
+class QuantoQuantizer:
+    """Wrapper for Quanto quantization to match the expected quantizer interface."""
+    
+    def __init__(self, optimizer, qtype, q_group_size):
+        self.optimizer = optimizer
+        self.qtype = qtype
+        self.q_group_size = q_group_size
+    
+    def quantize(self, tensor, axis, device, compute_dtype, nbits, group_size):
+        """Quantize a tensor using Quanto."""
+        from optimum.quanto import quantize_weight
+        
+        scale, zeropoint = self.optimizer(tensor, self.qtype, axis, self.q_group_size)
+        qtensor = quantize_weight(tensor, self.qtype, axis, scale, zeropoint, self.q_group_size)
+        
+        # Return (qtensor, metadata) tuple
+        meta = {
+            "axis": axis,
+            "scale": scale,
+            "zero": zeropoint,
+            "compute_dtype": compute_dtype,
+        }
+        return qtensor, meta
+    
+    def dequantize(self, qtensor, meta):
+        """Dequantize a tensor using Quanto."""
+        return qtensor.dequantize()
+
+
+@dataclass
+class UniformAffineQuantizerConfig:
+    nbits: int = 4       # e.g., 2/4/8
+    axis: int = -1       # current (might change between Keys and Values) quantization axis: 0 = channel-wise, 1 = token-wise
+    group_size: int = 64 # group last-dim (-1 = no grouping)
+    eps: float = 1e-9
+    symmetric: bool = False
+    dtype_out: torch.dtype = torch.float16  # dequant dtype
+    device: Optional[torch.device] = None
+
+class UniformAffineQuantizer:
+    """
+    Uniform affine quantizer with optional group-wise quantization.
+    Supports bitwidths: 2, 3, 4, 8.
+
+    Public API:
+    - quantize(x) -> (q_packed:uint8, scale, zp, orig_L:int)
+    - dequantize(q_packed, scale, zp, orig_L) -> x_float (dtype_out)
+    
+    quantize() calculates scale/zero-point, quantizes, packs the values.
+    dequantize() unpacks the values and dequantizes back to float using scale/zp.
+    """
+    def __init__(self, cfg: UniformAffineQuantizerConfig=None):
+        if cfg is None:
+            cfg = UniformAffineQuantizerConfig()
+        self.cfg = cfg
+
+    def _reshape_for_grouping(self, x: torch.Tensor, axis: int, group_size: int) -> Tuple[torch.Tensor, List[int]]:
+        """
+        We expect input tensor of shape [B, L, D] or [B, NH, L, HD].
+        So either D/HD and L should be divisible by group_size.
+        The axis parameter refers to the dimension along which tensor is to be grouped.
+            - axis = 0 means grouping along L (channel-wise quantization)
+            - axis = 1 means grouping along D/HD (token-wise quantization)
+
+        Moves the target axis to the last dimension first, then reshapes tensor to
+        [..., GroupDim, GroupSize] where GroupDim * GroupSize = OriginalDim.
+        
+        """
+        ndim = x.ndim
+        # Normalize axis depending on tensor shape
+        if axis < 0:
+            axis = axis % ndim
+        elif axis in [0,1]:    
+            if ndim == 3:
+                axis += 1  # shift for batch dim
+            elif ndim == 4:
+                axis += 2  # shift for batch and num of heads
+        else:
+            raise ValueError(f"Unsupported axis {axis} for tensor with ndim={ndim}")
+    
+        # Permute axis to last if needed
+        permutation = list(range(ndim))
+        if axis != ndim - 1:
+            permutation.pop(axis)
+            permutation.append(axis)
+            x_permuted = x.permute(permutation)
+        else:
+            x_permuted = x
+            
+        # Reshape to groups
+        # [..., Dim] -> [..., Dim//G, G]
+        if group_size > 0:
+            assert x_permuted.shape[-1] % group_size == 0, f"Dimension {x_permuted.shape[-1]} not divisible by group_size {group_size}"
+            x_grouped = x_permuted.view(*x_permuted.shape[:-1], -1, group_size)
+        else:
+            # No grouping (or group_size=-1), treat whole axis as one group
+            # [..., Dim] -> [..., 1, Dim]
+            x_grouped = x_permuted.unsqueeze(-2) 
+            
+        return x_grouped, permutation    
+
+    # ---------- calculating scale/zero-point ----------
+    def _calc_params(self, x_grouped: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate scale and zero point from input tensor whch is assumed
+        to be grouped [..., N_Groups, Group_Size].
+        """
+        # Min/Max along the last dimension (the group)
+        # x_grouped: [..., G]   
+        xmin = x_grouped.amin(dim=-1, keepdim=True) # [..., 1]
+        xmax = x_grouped.amax(dim=-1, keepdim=True) # [..., 1]
+    
+        if self.cfg.symmetric:
+            rng = torch.maximum(xmax.abs(), xmin.abs())
+            max_val = (1 << (self.cfg.nbits - 1)) - 1
+            scale = rng / ( max_val + self.cfg.eps )
+            zp = torch.zeros_like(scale)
+        else:
+            qmax = (1 << self.cfg.nbits) - 1
+            scale = (xmax - xmin) / (qmax + self.cfg.eps)
+            zp = torch.clamp((-xmin / (scale + self.cfg.eps)).round(), 0, qmax)
+        return scale, zp
+
+    # -----------  mapping (signed <-> unsigned) using bias   -----------
+    # ----------  alternative approach: 2's complement masking ----------
+    @staticmethod
+    def _to_unsigned(q: torch.Tensor, b: int, symmetric: bool) -> torch.Tensor:
+        if not symmetric:
+            return q.to(torch.uint8)
+        # For symmetric: shift signed range [-(2^(b-1)), 2^(b-1)-1] to unsigned [0, 2^b-1]
+        bias = 1 << (b - 1)  # 2^(b-1)
+        return (q + bias).to(torch.uint8)
+
+    @staticmethod
+    def _from_unsigned(u: torch.Tensor, b: int, symmetric: bool) -> torch.Tensor:
+        if not symmetric:
+            return u.to(torch.int8)
+        # For symmetric: shift unsigned range [0, 2^b-1] back to signed [-(2^(b-1)), 2^(b-1)-1]
+        bias = 1 << (b - 1)  # 2^(b-1)
+        return (u - bias).to(torch.int8)
+
+    # ---------- compact pack/unpack (last/first stage) ----------
+    def _pack(self, values: torch.Tensor, b: int) -> Tuple[torch.Tensor, int]:
+        """Pack along last dim. Returns (packed:uint8, orig_dim)."""
+        dim = values.size(-1)
+        if b == 8:  # trivial path
+            return values.to(torch.uint8), dim
+
+        uq = self._to_unsigned(values, b, self.cfg.symmetric)
+
+        if (8 % b) == 0:                           # 2/4-bit
+            per_byte = 8 // b
+            pad = (per_byte - (dim % per_byte)) % per_byte
+            if pad:
+                uq = torch.nn.functional.pad(uq, (0, pad))
+            uq = uq.view(*uq.shape[:-1], -1, per_byte)  # [..., Nbytes, per_byte]
+            packed = torch.zeros(uq.shape[:-1], dtype=torch.uint8, device=uq.device)
+            mask = (1 << b) - 1
+            for i in range(per_byte):
+                packed |= ((uq[..., i] & mask) << (i * b)).to(torch.uint8)
+            return packed, dim
+
+        if b == 3:                                  # 3-bit
+            pad = (8 - (dim % 8)) % 8
+            if pad:
+                uq = torch.nn.functional.pad(uq, (0, pad))
+            g = uq.view(*uq.shape[:-1], -1, 8).to(torch.int32)
+            b0 = (g[..., 0] | (g[..., 1] << 3) | (g[..., 2] << 6)) & 0xFF
+            b1 = (((g[..., 2] >> 2) & 0x01) | (g[..., 3] << 1) | (g[..., 4] << 4) | (g[..., 5] << 7)) & 0xFF
+            b2 = (((g[..., 5] >> 1) & 0x03) | (g[..., 6] << 2) | (g[..., 7] << 5)) & 0xFF
+            packed = torch.stack([b0.to(torch.uint8), b1.to(torch.uint8), b2.to(torch.uint8)], dim=-1).reshape(*g.shape[:-1], -1)
+            return packed, dim
+        
+        raise ValueError(f"Unsupported bitwidth for unpacking: {b}")
+    
+    def _unpack(self, packed: torch.Tensor, b: int, orig_dim: int) -> torch.Tensor:
+        """Unpack bytes along last dim into int8 lanes (signed if symmetric)."""
+        if b == 8:
+            return packed.to(torch.int8)[..., :orig_dim]
+
+        if (8 % b) == 0:                            # 2/4-bit
+            per_byte = 8 // b
+            bytes_ = packed
+            values = []
+            mask = (1 << b) - 1
+            for i in range(per_byte):
+                values.append(((bytes_ >> (i * b)) & mask).to(torch.uint8))
+            values = torch.stack(values, dim=-1).reshape(*bytes_.shape[:-1], -1)
+            values = values[..., :orig_dim]
+            return self._from_unsigned(values, b, self.cfg.symmetric)
+
+        if b == 3:
+            trip = packed.view(*packed.shape[:-1], -1, 3).to(torch.int32)
+            b0, b1, b2 = trip[..., 0], trip[..., 1], trip[..., 2]
+            a0 =  (b0      ) & 0x07
+            a1 =  (b0 >> 3 ) & 0x07
+            a2 = ((b0 >> 6) | ((b1 & 0x01) << 2)) & 0x07
+            a3 =  (b1 >> 1 ) & 0x07
+            a4 =  (b1 >> 4 ) & 0x07
+            a5 = ((b1 >> 7) | ((b2 & 0x03) << 1)) & 0x07
+            a6 =  (b2 >> 2 ) & 0x07
+            a7 =  (b2 >> 5 ) & 0x07
+            values = torch.stack([a0,a1,a2,a3,a4,a5,a6,a7], dim=-1).reshape(*trip.shape[:-1], -1).to(torch.uint8)
+            values = values[..., :orig_dim]
+            return self._from_unsigned(values, b, self.cfg.symmetric)
+
+        raise ValueError(f"Unsupported bitwidth for unpacking: {b}")
+
+    # ---------- core quantization logic ----------
+    def _quantize_core(self, x_grouped: torch.Tensor, scale: torch.Tensor, zp: torch.Tensor) -> torch.Tensor:
+        b = self.cfg.nbits
+        eps = self.cfg.eps
+        if self.cfg.symmetric:
+            x_q = (x_grouped / (scale + eps)).round()
+            x_q = torch.clamp(x_q, -(2**(b-1)), 2**(b-1)-1)
+        else:
+            x_q = (x_grouped / (scale + eps) + zp).round()
+            x_q = torch.clamp(x_q, 0, 2**b - 1)
+        return x_q
+
+    def _dequantize_core(self, q_grouped: torch.Tensor, scale: torch.Tensor, zp: torch.Tensor) -> torch.Tensor:
+        if self.cfg.symmetric:
+            x_deq = q_grouped.to(self.cfg.dtype_out) * scale
+        else:
+            x_deq = (q_grouped.to(self.cfg.dtype_out) - zp) * scale
+        return x_deq
+
+    # ---------- public API (packing last, unpacking first) ----------
+    def simulated_quantize(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Perform simulated quantization (quantize -> dequantize) without packing.
+        Useful for measuring quantization error.
+        """
+        # Update config
+        for k, v in kwargs.items():
+            if hasattr(self.cfg, k):
+                setattr(self.cfg, k, v)
+                
+        axis = self.cfg.axis
+        group_size = self.cfg.group_size
+
+        # 1. Reshape/Permute
+        x_grouped, perm = self._reshape_for_grouping(x, axis, group_size)
+        
+        # 2. Calculate Params
+        scale, zp = self._calc_params(x_grouped)
+        
+        # 3. Quantize
+        x_q = self._quantize_core(x_grouped, scale, zp)
+        
+        # 4. Dequantize
+        x_deq = self._dequantize_core(x_q, scale, zp)
+        
+        # 5. Reshape back
+        if group_size > 0:
+            x_flat = x_deq.view(*x_deq.shape[:-2], -1)
+        else:
+            x_flat = x_deq.squeeze(-2)
+            
+        inv_perm = [0] * len(perm)
+        for i, p in enumerate(perm):
+            inv_perm[p] = i
+            
+        x_out = x_flat.permute(inv_perm)
+        
+        return x_out
+
+    def quantize(self, x: torch.Tensor, **kwargs) -> Tuple[torch.Tensor,  dict]:
+        """
+        Quantize tensor according to config provided in kwargs.
+        Returns: q_packed, meta (info needed for dequantization)
+        """
+        # Update config
+        for k, v in kwargs.items():
+            if hasattr(self.cfg, k):
+                setattr(self.cfg, k, v)
+                
+        axis = self.cfg.axis
+        group_size = self.cfg.group_size
+        b = self.cfg.nbits
+        eps = self.cfg.eps
+
+        # 1. Reshape/Permute
+        x_grouped, perm = self._reshape_for_grouping(x, axis, group_size)
+        
+        # 2. Calculate Params
+        scale, zp = self._calc_params(x_grouped)
+
+        # 3. Quantize
+        x_q = self._quantize_core(x_grouped, scale, zp)
+
+        # 4. Pack
+        # Reshape back to [..., Dim] (where Dim is the permuted axis)
+        if group_size > 0:
+            x_q_flat = x_q.view(*x_q.shape[:-2], -1) 
+        else:
+            x_q_flat = x_q.squeeze(-2)
+        # Pack along the last dimension (which is 'axis')
+        q_packed, orig_dim = self._pack(x_q_flat.to(torch.uint8), b)
+        meta = {
+            'nbits': self.cfg.nbits,
+            'group_size': group_size,
+            'scale': scale, 
+            'zero': zp,   
+            'perm': perm,
+            'orig_dim': orig_dim,
+            # record keeping for sanity
+            'axis': axis,
+        }
+        return q_packed, meta
+
+    def dequantize(self, q_packed: torch.Tensor, meta: dict) -> torch.Tensor:
+        """
+        Accepts packed lanes; unpacks first, then standard affine dequant to dtype_out.
+        """
+        nbits = meta['nbits']
+        orig_dim = meta['orig_dim']
+        scale = meta['scale']
+        zp = meta['zero']
+        perm = meta['perm']
+        group_size = meta['group_size']
+        
+        # 1. Unpack
+        # Result is [..., Dim] (permuted)
+        q_unpacked = self._unpack(q_packed, nbits, orig_dim)
+        
+        # 2. Reshape to groups [..., Dim//G, G]
+        if group_size > 0:
+            q_grouped = q_unpacked.view(*q_unpacked.shape[:-1], -1, group_size)
+        else:
+            q_grouped = q_unpacked.unsqueeze(-2)
+
+        # 3. Dequantize
+        x_deq = self._dequantize_core(q_grouped, scale, zp)
+
+        # 4. Reshape back to flat [..., Dim]
+        if group_size > 0:
+            x_flat = x_deq.view(*x_deq.shape[:-2], -1)
+        else:
+            x_flat = x_deq.squeeze(-2)
+            
+        # 5. Permute back to original shape
+        # We need inverse permutation
+        inv_perm = [0] * len(perm)
+        for i, p in enumerate(perm):
+            inv_perm[p] = i
+            
+        x_out = x_flat.permute(inv_perm)
+        
+        return x_out
+
+# Regustering the customer quantizers
+REGISTERED_QUANTIZERS = {
+    "quanto": QuantoQuantizer,
+    "uq": UniformAffineQuantizer,
+}
+
+REGISTERED_QUANTIZER_CONFIGS = {
+    "uq": UniformAffineQuantizerConfig,
+}
 
 class QuantizedLayer(CacheLayerMixin):
     """
@@ -1111,6 +1506,8 @@ class QuantizedLayer(CacheLayerMixin):
         q_group_size: int = 64,
         residual_length: int = 128,
         content_type: CacheContentType = CacheContentType.POST_PROJ,
+        paired: bool = True,
+        is_simulating: bool = False,
     ):
         
         # residual_length should be at least q_group_size and divisible by q_group_size
@@ -1123,23 +1520,14 @@ class QuantizedLayer(CacheLayerMixin):
                 f"`residual_length` ({residual_length}) should be divisible by `q_group_size` ({q_group_size})"
             )
        
-        super().__init__(content_type=content_type)
+        super().__init__(content_type=content_type, paired=paired)
         self.nbits = nbits
         self.axis_key = axis_key
         self.axis_value = axis_value
         self.q_group_size = q_group_size
         self.residual_length = residual_length
         self.cumulative_length = 0
-        
-        # Store content_type before replacing content
-        self._content_type = content_type
-        # Will be replaced with QuantizedCacheContent in lazy_initialization
-        self.content = None
-
-    @property
-    def content_type(self) -> CacheContentType:
-        """Get the content type of this cache layer"""
-        return self._content_type
+        self.is_simulating = is_simulating
 
     @abstractmethod
     def _get_quantizer(self):
@@ -1148,7 +1536,7 @@ class QuantizedLayer(CacheLayerMixin):
 
     def lazy_initialization(self, states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]):
         """Initialize the quantized cache content."""
-        if self.content_type == CacheContentType.POST_PROJ:
+        if self.content_paired:
             key_states, _ = states
             self.dtype, self.device = key_states.dtype, key_states.device
         else:
@@ -1157,12 +1545,14 @@ class QuantizedLayer(CacheLayerMixin):
         # Create QuantizedCacheContent with the quantizer
         self.content = QuantizedCacheContent(
             content_type=self.content_type,
+            paired=self.content_paired,
             quantizer=self._get_quantizer(),
             nbits=self.nbits,
             axis_key=self.axis_key,
             axis_value=self.axis_value,
             q_group_size=self.q_group_size,
             residual_length=self.residual_length,
+            is_simulating=self.is_simulating,
         )
         
         self.is_initialized = True
@@ -1183,8 +1573,8 @@ class QuantizedLayer(CacheLayerMixin):
             The updated states
         """
         # Get the sequence length from the appropriate tensor
-        if self.content_type == CacheContentType.POST_PROJ:
-            key_states, value_states = states
+        if self.content_paired:
+            key_states, _ = states
             seq_len = key_states.shape[-2]
         else:  # POST_NORM or POST_NORM_CL
             seq_len = states.shape[-2]
@@ -1239,6 +1629,8 @@ class QuantizedLayerWithQuantizer(QuantizedLayer):
         q_group_size: int = 64,
         residual_length: int = 128,
         content_type: CacheContentType = CacheContentType.POST_PROJ,
+        paired: bool = True,
+        is_simulating: bool = False,
     ):
         if isinstance(axis, int):
             axis_key = axis
@@ -1252,17 +1644,30 @@ class QuantizedLayerWithQuantizer(QuantizedLayer):
             q_group_size=q_group_size,
             residual_length=residual_length,
             content_type=content_type,
+            paired=paired,
+            is_simulating=is_simulating,
         )
-        if quantizer is None:
-            raise ValueError("`quantizer` cannot be None for `QuantizedLayerWithQuantizer`")
+
         if isinstance(quantizer, str):
-            self.quantizer_class = None # TODO: implement string to class mapping for registered quantizers
+            # Get class from registry and create object
+            cls = REGISTERED_QUANTIZERS.get(quantizer, None)
+            cfg_cls = REGISTERED_QUANTIZER_CONFIGS.get(quantizer, None)
+            if cls is None or cfg_cls is None:
+                raise ValueError(f"Quantizer '{quantizer}' is not registered.")
+            cfg = cfg_cls(
+                nbits=nbits,
+                group_size=q_group_size,
+                axis=axis_key if content_type != CacheContentType.POST_PROJ else (axis_key, axis_value),
+            )
+            self.quantizer = cls(cfg=cfg)
         else:
-            self.quantizer_class = quantizer
+            self.quantizer = quantizer
+        if self.quantizer is None:
+            raise ValueError("`quantizer` cannot be None for `QuantizedLayerWithQuantizer`")
 
     def _get_quantizer(self):
         """Return the quantizer instance."""
-        return self.quantizer_class
+        return self.quantizer
 
 
 class HQQQuantizedLayer(QuantizedLayerWithQuantizer):
@@ -1302,37 +1707,7 @@ class HQQQuantizedLayer(QuantizedLayerWithQuantizer):
             residual_length=residual_length,
             content_type=content_type,
         )
-
-
-class QuantoQuantizer:
-    """Wrapper for Quanto quantization to match the expected quantizer interface."""
     
-    def __init__(self, optimizer, qtype, q_group_size):
-        self.optimizer = optimizer
-        self.qtype = qtype
-        self.q_group_size = q_group_size
-    
-    def quantize(self, tensor, axis, device, compute_dtype, nbits, group_size):
-        """Quantize a tensor using Quanto."""
-        from optimum.quanto import quantize_weight
-        
-        scale, zeropoint = self.optimizer(tensor, self.qtype, axis, self.q_group_size)
-        qtensor = quantize_weight(tensor, self.qtype, axis, scale, zeropoint, self.q_group_size)
-        
-        # Return (qtensor, metadata) tuple
-        meta = {
-            "axis": axis,
-            "scale": scale,
-            "zero": zeropoint,
-            "compute_dtype": compute_dtype,
-        }
-        return qtensor, meta
-    
-    def dequantize(self, qtensor, meta):
-        """Dequantize a tensor using Quanto."""
-        return qtensor.dequantize()
-
-
 class QuantoQuantizedLayer(QuantizedLayerWithQuantizer):
     """
     A quantized layer using the Quanto backend.
@@ -1382,7 +1757,6 @@ class QuantoQuantizedLayer(QuantizedLayerWithQuantizer):
             residual_length=residual_length,
             content_type=content_type,
         )
-
 
 class Cache:
     """
@@ -1688,13 +2062,16 @@ class DynamicCache(Cache):
             if hasattr(decoder_config, "num_kv_shared_layers"):
                 layer_types = layer_types[: -decoder_config.num_kv_shared_layers]
 
+            # GQA/MQA models have paired states
+            self.content_paired = use_paired_cache(decoder_config)
+
             for layer_type in layer_types:
                 # From a cache point of view, both sliding and chunked are the same in how they should behave and how many
                 # states they should return - only the mask changes to make them different at the end!
                 if layer_type in ("sliding_attention", "chunked_attention"):
                     layers.append(DynamicSlidingWindowLayer(sliding_window=sliding_window))
                 else:
-                    layers.append(DynamicLayer(content_type=content_type))
+                    layers.append(DynamicLayer(content_type=content_type, paired=self.content_paired))
 
         # In this case, use the passed data to already fill in the Cache
         if ddp_cache_data is not None:
@@ -1733,73 +2110,6 @@ class DynamicCache(Cache):
         for layer in self.layers:
             yield layer.keys, layer.values, getattr(layer, "_sliding_window_tensor", None)
 
-
-class HiddenStatesCache(DynamicCache):
-    """
-    A cache specifically for hidden states before K/V projection.
-    """
-
-    def __init__(
-        self,
-        num_hidden_layers: Optional[int] = None,
-        config: Optional[PreTrainedConfig] = None,
-    ) -> None:
-        super().__init__(
-            content_type=CacheContentType.POST_NORM,
-            num_hidden_layers=num_hidden_layers,
-            config=config,
-        )
-    #TODO: extend possibly with methods specific to hidden states caching 
-
-
-class HiddenDeltasCache(DynamicCache):
-    """
-    A cache for hidden state deltas (CL mode from XQuant paper).
-    Stores first hidden state + deltas between consecutive layers.
-    """
-
-    def __init__(
-        self,
-        num_hidden_layers: Optional[int] = None,
-        config: Optional[PreTrainedConfig] = None,
-    ) -> None:
-        super().__init__(
-            content_type=CacheContentType.POST_NORM_CL,
-            num_hidden_layers=num_hidden_layers,
-            config=config,
-        )
-        self.base_hidden_state: Optional[torch.Tensor] = None
-
-    def update(
-        self,
-        states: torch.Tensor,
-        layer_idx: int,
-        cache_kwargs: Optional[dict[str, Any]] = None,
-    ) -> torch.Tensor:
-        """For delta caching, compute and store deltas."""
-        if layer_idx == 0:
-            # Store base hidden state
-            self.base_hidden_state = states.clone()
-            return states
-        
-        # Compute delta from previous layer
-        prev_states = self.get_reconstructed_states(layer_idx - 1)
-        delta = states - prev_states
-        
-        # Cache the delta
-        return super().update(delta, layer_idx, cache_kwargs)
-
-    def get_reconstructed_states(self, layer_idx: int) -> torch.Tensor:
-        """Reconstruct hidden states from base + cumulative deltas."""
-        if layer_idx == 0:
-            return self.base_hidden_state
-        
-        result = self.base_hidden_state.clone()
-        for i in range(1, layer_idx + 1):
-            if i < len(self.layers) and self.layers[i].is_initialized:
-                result = result + self.layers[i].hidden_states
-        
-        return result
 
 
 class StaticCache(Cache):
@@ -1925,6 +2235,7 @@ class QuantizedCache(Cache):
         residual_length: int = 128,
         content_type: Union[CacheContentType, str] = CacheContentType.POST_PROJ,
         quantizer: Optional[Any] = None,
+        is_simulating: bool = False,
     ):
         if backend == "quanto":
             layer_class = QuantoQuantizedLayer
@@ -1938,11 +2249,11 @@ class QuantizedCache(Cache):
         content_type = CacheContentType.from_string(content_type) if isinstance(content_type, str) else content_type
 
         config = config.get_text_config(decoder=True)
-        
+        self.content_paired = use_paired_cache(config)
         # Create layers with or without quantizer parameter depending on backend
         if backend == "custom":
             layers = [
-                layer_class(quantizer, nbits, (axis_key, axis_value), q_group_size, residual_length, content_type)
+                layer_class(quantizer, nbits, (axis_key, axis_value), q_group_size, residual_length, content_type, paired=self.content_paired, is_simulating=is_simulating)
                 for _ in range(config.num_hidden_layers)
             ]
         else:
