@@ -279,6 +279,55 @@ class LlamaAttention(nn.Module):
         self.k_proj_down = None
         self.v_proj_up = None
         self.v_proj_down = None
+        
+        # For SVD-based projection: U_kv from SVD of [W_k | W_v]
+        self._U_kv: Optional[torch.Tensor] = None
+
+    def _compute_U_kv(self, is_cross_layer = True) -> Optional[torch.Tensor]:
+        """
+        Compute U_kv for SVD-based latent projection (used when content_paired=True).
+        
+        When content_paired is True (i.e., cache stores paired down-projected states),
+        we need a projection matrix for memory-efficient storage.
+        
+        Concatenates W_k and W_v: W_kv = [W_k | W_v] of shape (hidden_dim, 2*kv_dim)
+        Then computes SVD: W_kv = U_kv @ Σ_kv @ B_kv^T
+        Returns U_kv of shape (hidden_dim, 2*kv_dim)
+        
+        Args:
+            is_cross_layer: If False, returns None (no projection needed)
+            
+        Returns:
+            U_kv tensor or None if is_cross_layer is False.
+        """
+        if not is_cross_layer:
+            return None
+            
+        if self._U_kv is not None:
+            return self._U_kv
+        
+        with torch.no_grad():
+            # W_k: (kv_dim, hidden_dim), W_v: (kv_dim, hidden_dim)
+            W_k = self.k_proj.weight.data  # (num_kv_heads * head_dim, hidden_size)
+            W_v = self.v_proj.weight.data  # (num_kv_heads * head_dim, hidden_size)
+            dtype = W_k.dtype
+            
+            # Concatenate: W_kv has shape (2*kv_dim, hidden_dim)
+            W_kv = torch.cat([W_k, W_v], dim=0)
+            
+            # We want U_kv of shape (hidden_dim, 2*kv_dim) for x @ U_kv projection
+            # So we work with W_kv^T of shape (hidden_dim, 2*kv_dim)
+            W_kv_T = W_kv.T.float()  # (hidden_dim, 2*kv_dim)
+            
+            # SVD: W_kv_T = U @ S @ V^T
+            # U: (hidden_dim, r), S: (r,), V: (2*kv_dim, r)
+            # where r = min(hidden_dim, 2*kv_dim) = 2*kv_dim
+            U, S, V = torch.linalg.svd(W_kv_T, full_matrices=False)
+            
+            # For latent projection, we use U directly (orthonormal columns)
+            self._U_kv = U.to(dtype)  # (hidden_dim, 2*kv_dim)
+            
+        return self._U_kv
 
     def _split_linear(self, linear: nn.Linear) -> tuple[nn.Linear, nn.Linear]:
         """
@@ -395,6 +444,7 @@ class LlamaAttention(nn.Module):
                     key_states = apply_rotary_pos_emb_single(key_states, full_cos, full_sin)
 
         elif past_key_values is not None and past_key_values.content_type != "post_proj":
+            # Non-post_proj caching modes: post_norm, post_norm_cl
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             if past_key_values.content_paired:
@@ -426,6 +476,13 @@ class LlamaAttention(nn.Module):
                 else:
                     key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
             else:
+                # post_norm and post_norm_cl modes: cache full hidden states
+                # For post_norm_cl with GQA, optionally use latent projection for deltas
+                if past_key_values.content_type == "post_norm_cl":
+                    U_kv = self._compute_U_kv(is_cross_layer=past_key_values.requires_down_proj)
+                    cache_kwargs["U_kv"] = U_kv
+                
+                # Update cache with hidden states; cache handles projection internally
                 full_hidden_states = past_key_values.update(hidden_states, self.layer_idx, cache_kwargs)
             
                 # prefill stage
@@ -437,6 +494,7 @@ class LlamaAttention(nn.Module):
                     full_input_shape = full_hidden_states.shape[:-1]
                     full_hidden_shape = (*full_input_shape, -1, self.head_dim)
 
+                # Project reconstructed hidden states to Q/K/V
                 query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                 key_states = self.k_proj(full_hidden_states).view(full_hidden_shape).transpose(1, 2)
                 value_states = self.v_proj(full_hidden_states).view(full_hidden_shape).transpose(1, 2)
@@ -575,19 +633,38 @@ class LlamaModel(LlamaPreTrainedModel):
             
             # If past_key_values are None and we are simulating quantized cache, we create a dummy cache to simulate the behavior
             if is_simulating:
-                from transformers.cache_utils import QuantizedCache
-                content_type = "post_proj"
-                # Create a temporary cache to simulate quantized cache behavior for post_norm caching
-                past_key_values = QuantizedCache(backend='custom', config=self.config, 
-                       content_type=content_type,
-                       quantizer='uq',
-                       # defaults
-                       nbits = 4,
-                       axis_key = 1,
-                       axis_value = 0,
-                       q_group_size = 64,
-                       residual_length = 128,
-                       is_simulating=is_simulating)
+                from transformers.cache_utils import QuantizedCache, SimulatedCLQuantizedCache
+
+                content_type = "post_norm_cl" # "post_proj", "post_norm", "post_norm_cl"
+                # Create a temporary cache to simulate quantized cache behavior
+                # if content_type == "post_proj":
+                #     past_key_values = QuantizedCache(backend='custom', config=self.config, 
+                #         content_type=content_type,
+                #         quantizer='uq',
+                #         # defaults
+                #         nbits = 2,
+                #         axis_key = 0,
+                #         axis_value = 1,
+                #         q_group_size = 64,
+                #         residual_length = 128,
+                #         is_simulating=is_simulating)
+                if content_type == "post_proj" or content_type == "post_norm":
+                    past_key_values = QuantizedCache(backend='simulated', config=self.config, 
+                        content_type=content_type,
+                        nbits = 2,
+                        axis_key = 0,
+                        axis_value = 1,
+                        q_group_size = 64,
+                        residual_length = 128,
+                        is_simulating=is_simulating)
+                elif content_type == "post_norm_cl":
+                    past_key_values = SimulatedCLQuantizedCache(
+                        config=self.config, 
+                        nbits = 4,
+                        axis = 0,
+                        group_size = 64,
+                        is_simulating=is_simulating
+                        ) 
             else:
                 past_key_values = DynamicCache(config=self.config)
 

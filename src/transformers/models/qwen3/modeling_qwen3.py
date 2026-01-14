@@ -272,12 +272,61 @@ class Qwen3Attention(nn.Module):
         self.k_proj_down, self.k_proj_up = None, None
         self.v_proj_down, self.v_proj_up = None, None
 
+        # For SVD-based projection: U_kv from SVD of [W_k | W_v]
+        self._U_kv: Optional[torch.Tensor] = None
+
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+
+    def _compute_U_kv(self, is_cross_layer = True) -> Optional[torch.Tensor]:
+        """
+        Compute U_kv for SVD-based latent projection (used when content_paired=True).
+        
+        When content_paired is True (i.e., cache stores paired down-projected states),
+        we need a projection matrix for memory-efficient storage.
+        
+        Concatenates W_k and W_v: W_kv = [W_k | W_v] of shape (hidden_dim, 2*kv_dim)
+        Then computes SVD: W_kv = U_kv @ Σ_kv @ B_kv^T
+        Returns U_kv of shape (hidden_dim, 2*kv_dim)
+        
+        Args:
+            is_cross_layer: If False, returns None (no projection needed)
+            
+        Returns:
+            U_kv tensor or None if is_cross_layer is False.
+        """
+        if not is_cross_layer:
+            return None
+            
+        if self._U_kv is not None:
+            return self._U_kv
+        
+        with torch.no_grad():
+            # W_k: (kv_dim, hidden_dim), W_v: (kv_dim, hidden_dim)
+            W_k = self.k_proj.weight.data  # (num_kv_heads * head_dim, hidden_size)
+            W_v = self.v_proj.weight.data  # (num_kv_heads * head_dim, hidden_size)
+            dtype = W_k.dtype
+            
+            # Concatenate: W_kv has shape (2*kv_dim, hidden_dim)
+            W_kv = torch.cat([W_k, W_v], dim=0)
+            
+            # We want U_kv of shape (hidden_dim, 2*kv_dim) for x @ U_kv projection
+            # So we work with W_kv^T of shape (hidden_dim, 2*kv_dim)
+            W_kv_T = W_kv.T.float()  # (hidden_dim, 2*kv_dim)
+            
+            # SVD: W_kv_T = U @ S @ V^T
+            # U: (hidden_dim, r), S: (r,), V: (2*kv_dim, r)
+            # where r = min(hidden_dim, 2*kv_dim) = 2*kv_dim
+            U, S, V = torch.linalg.svd(W_kv_T, full_matrices=False)
+            
+            # For latent projection, we use U directly (orthonormal columns)
+            self._U_kv = U.to(dtype)  # (hidden_dim, 2*kv_dim)
+            
+        return self._U_kv
 
     def _get_rope_config(self, tensor_for_device, seq_len, attention_mask, is_eager):
         if attention_mask is None:
@@ -425,6 +474,13 @@ class Qwen3Attention(nn.Module):
                 else:
                     key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
             else:
+                # post_norm and post_norm_cl modes: cache full hidden states
+                # For post_norm_cl with GQA, optionally use latent projection for deltas
+                if past_key_values.content_type == "post_norm_cl":
+                    U_kv = self._compute_U_kv(is_cross_layer=past_key_values.requires_down_proj)
+                    cache_kwargs["U_kv"] = U_kv
+                
+                # Update cache with hidden states; cache handles projection internally
                 full_hidden_states = past_key_values.update(hidden_states, self.layer_idx, cache_kwargs)
             
                 # prefill stage
@@ -436,6 +492,7 @@ class Qwen3Attention(nn.Module):
                     full_input_shape = full_hidden_states.shape[:-1]
                     full_hidden_shape = (*full_input_shape, -1, self.head_dim)
 
+                # Project reconstructed hidden states to Q/K/V
                 query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
                 key_states = self.k_norm(self.k_proj(full_hidden_states).view(full_hidden_shape)).transpose(1, 2)
                 value_states = self.v_proj(full_hidden_states).view(full_hidden_shape).transpose(1, 2)

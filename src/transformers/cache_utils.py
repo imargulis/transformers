@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from enum import Enum
@@ -24,32 +26,58 @@ _is_torch_greater_or_equal_than_2_7 = is_torch_greater_or_equal("2.7", accept_de
 
 logger = logging.get_logger(__name__)
  
-# Infer attention type from the model config
-def use_paired_cache(config: PreTrainedConfig) -> bool:
-    """Infer attention type from model configuration"""
 
+def requires_kv_projection(config: PreTrainedConfig) -> bool:
+    """
+    Determine if the model benefits from storing projected K/V states separately.
+    
+    For POST_NORM caching (hidden states), this determines whether to store:
+    - Two separate streams (K-projected and V-projected hidden states) - when True
+    - A single hidden state stream (no projection needed) - when False
+    
+    This is True for GQA (Grouped-Query Attention) models where:
+    1. num_attention_heads > num_key_value_heads (GQA/MQA architecture)
+    2. The K/V linear transforms are actual down-projections (hidden_dim > kv_dim)
+    
+    For such models, caching the projected states saves memory compared to 
+    caching full hidden states, as kv_dim < hidden_dim.
+    
+    Args:
+        config: Model configuration
+        
+    Returns:
+        True if model uses GQA with down-projected K/V, False otherwise
+    """
     n_h = config.num_attention_heads
     n_kv = getattr(config, "num_key_value_heads", n_h)
-    use_paired_cache = (n_h // n_kv) > 1
+    is_gqa = (n_h // n_kv) > 1
 
-    if use_paired_cache:
-        # verify that linear transforms for K/V are down-projections
+    if is_gqa:
+        # Verify that linear transforms for K/V are down-projections
         head_dim = getattr(config, "head_dim", None)
         hidden_dim = getattr(config, "hidden_size", None)
         if not head_dim or not hidden_dim:
-            logger.warning("Could not infer head_dim or hidden_size from config. Assuming paired cache.")
-            return use_paired_cache
-        if hidden_dim <= (head_dim * n_kv):
-            use_paired_cache = False
-            logger.info("Current model configuration does not result in down-projected K/V. Using non-paired cache.")
+            logger.warning("Could not infer head_dim or hidden_size from config. Assuming GQA with down-projection.")
+            return True
+        kv_dim = head_dim * n_kv
+        if hidden_dim <= kv_dim:
+            logger.info("Model uses GQA but K/V projections are not down-projections. Using single-stream cache.")
+            return False
+        return True
 
-    return use_paired_cache
+    return False
+
+
+# Backward compatibility alias
+def use_paired_cache(config: PreTrainedConfig) -> bool:
+    """Deprecated: Use requires_kv_projection instead."""
+    return requires_kv_projection(config)
 
 class CacheContentType(Enum):
     """Enum to specify what type of data is being cached"""
-    POST_PROJ    = "post_proj"         # Traditional K/V caching
-    POST_NORM    = "post_norm"         # Pre-projection hidden states
-    POST_NORM_CL = "post_norm_cl"      # Delta-based hidden states (CL mode)
+    POST_PROJ       = "post_proj"         # Traditional K/V caching
+    POST_NORM       = "post_norm"         # Pre-(kv)projection hidden states
+    POST_NORM_CL    = "post_norm_cl"      # Delta-based hidden states (CL mode), supports U_kv projection for GQA
 
     @classmethod
     def from_string(cls, value: str) -> "CacheContentType":
@@ -86,7 +114,7 @@ class CacheContent:
         if self.content_paired: 
             self.keys: Optional[torch.Tensor] = None
             self.values: Optional[torch.Tensor] = None
-        else:  # POST_NORM w/o projection
+        else:  # POST_NORM w/o projection (rare case since most models use GQA which also requires projections)
             self.hidden_states: Optional[torch.Tensor] = None
            
     def __repr__(self):
@@ -275,9 +303,9 @@ class QuantizedCacheContent(CacheContent):
             value_total_len = value_states.shape[-2]
             
             key_quantizable_len = (key_total_len // self.q_group_size) * self.q_group_size
-            #value_quantizable_len = (value_total_len // self.q_group_size) * self.q_group_size
-            # TODO: currently testing single key quantization. Revert back !!!
-            value_quantizable_len = max(0, value_total_len - self.residual_length)
+            value_quantizable_len = (value_total_len // self.q_group_size) * self.q_group_size
+            # EXPERIMENTAL: currently testing single key quantization. Revert back !!!
+            #value_quantizable_len = max(0, value_total_len - self.residual_length)
 
             # Initialize keys
             if key_quantizable_len > 0:
@@ -401,7 +429,7 @@ class QuantizedCacheContent(CacheContent):
         self,
         states: tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Update POST_PROJ cache with separate KV streams."""
+        """Update POST_PROJ cache with separate K/V streams."""
         key_states, value_states = states
         
         # Process keys
@@ -443,11 +471,11 @@ class QuantizedCacheContent(CacheContent):
         # Check if values residual stream needs to be flushed
         if values_residual_len >= self.residual_length:
             # Remove q_group_size elements from the front (FIFO) 
-            # values_to_quantize = self.values[..., :self.q_group_size, :].contiguous()
-            # self.values = self.values[..., self.q_group_size:, :]
-            # !!!! TODO: currently testing single key FIFO (token axis only is valid.) Revert back !!!
-            values_to_quantize = self.values[..., :1, :].contiguous()
-            self.values = self.values[..., 1:, :]
+            values_to_quantize = self.values[..., :self.q_group_size, :].contiguous()
+            self.values = self.values[..., self.q_group_size:, :]
+            # !!!! EXPERIMENTAL: currently testing single key FIFO (token axis only is valid.) !!!
+            # values_to_quantize = self.values[..., :1, :].contiguous()
+            # self.values = self.values[..., 1:, :]
             
             # Quantize the removed group
             new_quantized_values = self.quantizer.quantize(
@@ -1144,7 +1172,7 @@ class UniformAffineQuantizerConfig:
     nbits: int = 4       # e.g., 2/4/8
     axis: int = -1       # current (might change between Keys and Values) quantization axis: 0 = channel-wise, 1 = token-wise
     group_size: int = 64 # group last-dim (-1 = no grouping)
-    eps: float = 1e-9
+    eps: float = 1e-6
     symmetric: bool = False
     dtype_out: torch.dtype = torch.float16  # dequant dtype
     device: Optional[torch.device] = None
@@ -1166,7 +1194,8 @@ class UniformAffineQuantizer:
             cfg = UniformAffineQuantizerConfig()
         self.cfg = cfg
 
-    def _reshape_for_grouping(self, x: torch.Tensor, axis: int, group_size: int) -> Tuple[torch.Tensor, List[int]]:
+    @staticmethod
+    def _reshape_for_grouping(x: torch.Tensor, axis: int, group_size: int) -> Tuple[torch.Tensor, List[int]]:
         """
         We expect input tensor of shape [B, L, D] or [B, NH, L, HD].
         So either D/HD and L should be divisible by group_size.
@@ -1175,7 +1204,7 @@ class UniformAffineQuantizer:
             - axis = 1 means grouping along D/HD (token-wise quantization)
 
         Moves the target axis to the last dimension first, then reshapes tensor to
-        [..., GroupDim, GroupSize] where GroupDim * GroupSize = OriginalDim.
+        [..., GroupNum, GroupSize] where GroupNum * GroupSize = OriginalDim.
         
         """
         ndim = x.ndim
@@ -1229,8 +1258,11 @@ class UniformAffineQuantizer:
             zp = torch.zeros_like(scale)
         else:
             qmax = (1 << self.cfg.nbits) - 1
-            scale = (xmax - xmin) / (qmax + self.cfg.eps)
-            zp = torch.clamp((-xmin / (scale + self.cfg.eps)).round(), 0, qmax)
+            # scale = (xmax - xmin) / (qmax + self.cfg.eps)
+            # zp = torch.clamp((-xmin / (scale + self.cfg.eps)).round(), 0, qmax)
+            # !!! TESTING:
+            scale = (xmax - xmin).clamp(min=self.cfg.eps) / (qmax)
+            zp = (-xmin / scale)
         return scale, zp
 
     # -----------  mapping (signed <-> unsigned) using bias   -----------
@@ -1326,8 +1358,11 @@ class UniformAffineQuantizer:
             x_q = (x_grouped / (scale + eps)).round()
             x_q = torch.clamp(x_q, -(2**(b-1)), 2**(b-1)-1)
         else:
-            x_q = (x_grouped / (scale + eps) + zp).round()
-            x_q = torch.clamp(x_q, 0, 2**b - 1)
+            # x_q = (x_grouped / (scale + eps) + zp).round()
+            # x_q = torch.clamp(x_q, 0, 2**b - 1)
+            # TESTING:
+            x_q = (x_grouped / (scale) + zp)
+            x_q = torch.clamp(x_q, 0, 2**b - 1).round()
         return x_q
 
     def _dequantize_core(self, q_grouped: torch.Tensor, scale: torch.Tensor, zp: torch.Tensor) -> torch.Tensor:
@@ -1390,9 +1425,8 @@ class UniformAffineQuantizer:
         axis = self.cfg.axis
         group_size = self.cfg.group_size
         b = self.cfg.nbits
-        eps = self.cfg.eps
 
-        # 1. Reshape/Permute
+        # 1. Permute and Reshape
         x_grouped, perm = self._reshape_for_grouping(x, axis, group_size)
         
         # 2. Calculate Params
@@ -1473,7 +1507,7 @@ REGISTERED_QUANTIZER_CONFIGS = {
 
 class QuantizedLayer(CacheLayerMixin):
     """
-    A quantized layer is an adaptation of DynamicLayer suitable to hold quantized contentsimilar to what is described in the 
+    A quantized layer is an adaptation of DynamicLayer suitable to hold quantized content similar to what is described in the 
     [KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache paper](https://huggingface.co/papers/2402.02750).
     It allows the model to generate longer sequence length without allocating too much memory for the key and value caches by
     applying quantization.
@@ -2062,8 +2096,8 @@ class DynamicCache(Cache):
             if hasattr(decoder_config, "num_kv_shared_layers"):
                 layer_types = layer_types[: -decoder_config.num_kv_shared_layers]
 
-            # GQA/MQA models have paired states
-            self.content_paired = use_paired_cache(decoder_config)
+            # GQA/MQA models benefit from storing projected K/V separately
+            self.content_paired = requires_kv_projection(decoder_config)
 
             for layer_type in layer_types:
                 # From a cache point of view, both sliding and chunked are the same in how they should behave and how many
@@ -2111,6 +2145,531 @@ class DynamicCache(Cache):
             yield layer.keys, layer.values, getattr(layer, "_sliding_window_tensor", None)
 
 
+@dataclass
+class SimulatedQuantizedCacheConfig:
+    """
+    Configuration class for Simulated Quantized cache settings.
+    """
+    sink_length: int = 0
+    residual_buffer_length: int = 128
+    group_size: int = 64
+    kbits: int = 4
+    vbits: int = 4
+    kaxis: int = 0
+    vaxis: int = 1
+    is_simulating: bool = False
+
+
+class SimulatedQuantizedCacheContent(CacheContent):
+    """
+    Cache content that implements simulated (fake) quantization with sink+buffer strategy.
+    
+    Uses a sink + buffer strategy similar to KIVI:
+    - First `sink_length` tokens are kept in full precision (sink)
+    - Middle tokens are fake-quantized (quantize then immediately dequantize)
+    - Last `residual_buffer_length` tokens are kept in full precision (buffer)
+    
+    Supports both paired (POST_PROJ) and non-paired (POST_NORM) content types.
+    
+    Args:
+        content_type: Type of content to cache (POST_PROJ, POST_NORM, or POST_NORM_CL)
+        paired: Whether content is paired (keys/values) or single (hidden_states)
+        sink_length: Number of initial tokens to keep in full precision
+        residual_buffer_length: Number of recent tokens to keep in full precision
+        group_size: Group size for quantization
+        kbits: Number of bits for key/hidden_state quantization
+        vbits: Number of bits for value quantization (only used for POST_PROJ)
+        kaxis: Axis for key quantization (0=channel-wise, 1=token-wise)
+        vaxis: Axis for value quantization (0=channel-wise, 1=token-wise)
+    """
+    
+    def __init__(
+        self,
+        content_type: CacheContentType,
+        paired: bool,
+        sink_length: int = 32,
+        residual_buffer_length: int = 128,
+        group_size: int = 64,
+        kbits: int = 2,
+        vbits: int = 2,
+        kaxis: int = 0,
+        vaxis: int = 1,
+        is_simulating: bool = False,
+    ):
+        super().__init__(content_type, paired)
+        self.sink_length = sink_length
+        self.residual_buffer_length = residual_buffer_length
+        self.current_residual_k_buffer_length = 0
+        self.current_residual_v_buffer_length = 0
+        self.group_size = group_size
+        self.kbits = kbits
+        self.vbits = vbits
+        self.kaxis = kaxis
+        self.vaxis = vaxis
+        self.is_simulating = is_simulating
+    
+    @staticmethod
+    def _fake_quant_groupwise(
+        data: torch.Tensor,
+        group_size: int,
+        bit: int,
+        axis: int = 0,
+    ) -> torch.Tensor:
+        """
+        Simulate the numerical effect of group-wise quantization.
+        Input and output are both float tensors, used for 'fake quantization'.
+        
+        Args:
+            data: Input float tensor with shape:
+                  - For paired (POST_PROJ): (B, nh, T, D) where T=seq_len, D=head_dim
+                  - For non-paired (POST_NORM): (B, T, D) where T=seq_len, D=hidden_dim
+            group_size: Number of elements per quant group
+            bit: Quantization bit width (e.g., 2 or 4)
+            axis: Axis to quantize along:
+                  - 0: channel-wise (quantize along D, group along T)
+                  - 1: token-wise (quantize along T, group along D)
+
+        Returns:
+            dequantized_data: same shape as input, float tensor with fake quantized values
+        """
+        if bit >= 16:  # No quantization needed
+            return data
+        
+        ndim = data.dim()
+        orig_dtype = data.dtype
+        
+        # For axis=0 (channel-wise), we need to transpose to put sequence dim last
+        # Then we can use _fake_quant_groupwise_lastdim on the transposed data
+        if axis == 0:
+            # Transpose to move sequence dim to last
+            if ndim == 4:  # (B, nh, T, D) -> (B, nh, D, T)
+                data = data.transpose(2, 3).contiguous()
+            else:  # (B, T, D) -> (B, D, T)
+                data = data.transpose(1, 2).contiguous()
+        
+        # Apply fake quantization along last dim
+        result = SimulatedQuantizedCacheContent._fake_quant_groupwise_lastdim(data, group_size, bit)
+        
+        # Transpose back if needed
+        if axis == 0:
+            if ndim == 4:
+                result = result.transpose(2, 3)
+            else:
+                result = result.transpose(1, 2)
+        
+        return result.contiguous().to(orig_dtype)
+    
+    @staticmethod
+    def _fake_quant_groupwise_lastdim(
+        data: torch.Tensor,
+        group_size: int,
+        bit: int
+    ) -> torch.Tensor:
+        """
+        Simulate the numerical effect of group-wise quantization along the last dim.
+        Input and output are both float tensors, used for 'fake quantization'.
+        
+        This is the core quantization routine. For quantization along other axes,
+        use `_fake_quant_groupwise` which handles axis transposition.
+        
+        Args:
+            data: Input tensor, assumes last dim is divisible by group_size
+            group_size: Number of elements per quant group along last dim
+            bit: Quantization bit width (e.g., 2 or 4)
+
+        Returns:
+            dequantized_data: same shape as input, float tensor with fake quantized values
+        """
+        if bit >= 16:  # No quantization needed
+            return data
+        
+        orig_shape = data.shape
+        last_dim = orig_shape[-1]
+        
+        if last_dim % group_size != 0:
+            raise ValueError(f"Last dim ({last_dim}) must be divisible by group_size ({group_size})")
+        
+        data = data.contiguous()
+        G = last_dim // group_size
+        x = data.view(*orig_shape[:-1], G, group_size)
+        
+        # Compute min and max per group
+        mn = x.amin(dim=-1, keepdim=True)
+        mx = x.amax(dim=-1, keepdim=True)
+        eps = 1e-4 if data.dtype in (torch.float16, torch.bfloat16) else 1e-6
+        
+        # Asymmetric quantization
+        scale = (mx - mn).clamp(min=eps) / (2 ** bit - 1)
+        max_val = 2 ** bit - 1
+        
+        # Fake quantization
+        q = ((x - mn) / scale).clamp(0, max_val).round()
+        dq = q * scale + mn
+        
+        return dq.view(orig_shape).to(data.dtype)
+    
+    def initialize(
+        self,
+        states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]
+    ) -> Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """
+        Initialize the cache with initial states and apply fake quantization to middle portion.
+        
+        Args:
+            states: Either (key_states, value_states) tuple or hidden_states tensor
+            
+        Returns:
+            The states to return for attention (before in-place quantization is applied)
+        """
+        if self.content_paired:
+            return self._initialize_paired(states)
+        else:
+            return self._initialize_non_paired(states)
+    
+    def _initialize_paired(
+        self,
+        states: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Initialize POST_PROJ cache with paired K/V states.
+        
+        Quantization strategy:
+        - Keys: Quantize in groups of group_size, keeping sink_length unquantized at start
+          and at most (residual_buffer_length - 1) unquantized at end
+        - Values (channel-wise, axis=0): Same behavior as keys
+        - Values (token-wise, axis=1): Keep buffer full (residual_buffer_length), 
+          quantize all values after sink_length
+        """
+        key_states, value_states = states
+        
+        # Store the full states
+        self.keys = key_states.detach().clone()
+        self.values = value_states.detach().clone()
+        current_cache_length = self.keys.shape[-2]
+        
+        # Return copies before quantization
+        keys_to_return = self.keys.detach().clone()
+        values_to_return = self.values.detach().clone()
+        
+        # No quantization needed if cache length <= sink_length + residual_buffer_length
+        if current_cache_length <= self.sink_length + self.residual_buffer_length:
+            self.current_residual_k_buffer_length = max(0, current_cache_length - self.sink_length)
+            self.current_residual_v_buffer_length = max(0, current_cache_length - self.sink_length)
+            return keys_to_return, values_to_return
+        
+        # Quantize keys: keep at most (residual_buffer_length - 1) unquantized at end
+        start_idx = self.sink_length
+        num_tokens_after_sink = current_cache_length - self.sink_length
+        # Number of full groups we can quantize
+        num_groups_to_quantize = (num_tokens_after_sink - self.residual_buffer_length + self.group_size) // self.group_size
+        num_tokens_to_quantize = num_groups_to_quantize * self.group_size
+        end_idx = start_idx + num_tokens_to_quantize
+        self.current_residual_k_buffer_length = num_tokens_after_sink - num_tokens_to_quantize
+        
+        if num_tokens_to_quantize > 0:
+            key_slice = self.keys[..., start_idx:end_idx, :]
+            key_slice = self._fake_quant_groupwise(key_slice, self.group_size, self.kbits, self.kaxis)
+            self.keys[..., start_idx:end_idx, :] = key_slice
+        
+        # Quantize values based on axis
+        if self.vaxis == 1:
+            # Token-wise: keep buffer full (residual_buffer_length), quantize all after sink
+            num_tokens_to_quantize_v = num_tokens_after_sink - self.residual_buffer_length
+            end_idx_v = start_idx + num_tokens_to_quantize_v
+            self.current_residual_v_buffer_length = self.residual_buffer_length
+            if num_tokens_to_quantize_v > 0:
+                value_slice = self.values[..., start_idx:end_idx_v, :]
+                value_slice = self._fake_quant_groupwise(value_slice, self.group_size, self.vbits, self.vaxis)
+                self.values[..., start_idx:end_idx_v, :] = value_slice
+        else:
+            # Channel-wise: same behavior as keys
+            self.current_residual_v_buffer_length = self.current_residual_k_buffer_length
+            if num_tokens_to_quantize > 0:
+                value_slice = self.values[..., start_idx:end_idx, :]
+                value_slice = self._fake_quant_groupwise(value_slice, self.group_size, self.vbits, self.vaxis)
+                self.values[..., start_idx:end_idx, :] = value_slice
+        
+        # When simulating, return the quantized states to measure quantization effect on perplexity
+        if self.is_simulating:
+            return self.keys.detach().clone(), self.values.detach().clone()
+        
+        return keys_to_return, values_to_return
+    
+    def _initialize_non_paired(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        Initialize POST_NORM cache with hidden states.
+        
+        Same logic as keys in _initialize_paired: quantize in groups of group_size,
+        keeping sink_length unquantized at start and at most (residual_buffer_length - 1) 
+        unquantized at end.
+        """
+        # Store the full states
+        self.hidden_states = states.detach().clone()
+        current_cache_length = self.hidden_states.shape[-2]
+        
+        # Return copy before quantization
+        states_to_return = self.hidden_states.detach().clone()
+        
+        # No quantization needed if cache length <= sink_length + residual_buffer_length
+        if current_cache_length <= self.sink_length + self.residual_buffer_length:
+            self.current_residual_k_buffer_length = max(0, current_cache_length - self.sink_length)
+            return states_to_return
+        
+        # Quantize: keep at most (residual_buffer_length - 1) unquantized at end
+        start_idx = self.sink_length
+        num_tokens_after_sink = current_cache_length - self.sink_length
+        # Number of full groups we can quantize
+        num_groups_to_quantize = (num_tokens_after_sink - self.residual_buffer_length + self.group_size) // self.group_size
+        num_tokens_to_quantize = num_groups_to_quantize * self.group_size
+        end_idx = start_idx + num_tokens_to_quantize
+        self.current_residual_k_buffer_length = num_tokens_after_sink - num_tokens_to_quantize
+        
+        if num_tokens_to_quantize > 0:
+            hs_slice = self.hidden_states[..., start_idx:end_idx, :]
+            hs_slice = self._fake_quant_groupwise(hs_slice, self.group_size, self.kbits, self.kaxis)
+            self.hidden_states[..., start_idx:end_idx, :] = hs_slice
+        
+        # When simulating, return the quantized states to measure quantization effect on perplexity
+        if self.is_simulating:
+            return self.hidden_states.detach().clone()
+        
+        return states_to_return
+    
+    def update(
+        self,
+        states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]
+    ) -> Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """
+        Update the cache with new states and apply fake quantization as needed.
+        
+        Args:
+            states: Either (key_states, value_states) tuple or hidden_states tensor
+            
+        Returns:
+            The states to return for attention (copies before in-place quantization)
+        """
+        if self.content_paired:
+            return self._update_paired(states)
+        else:
+            return self._update_non_paired(states)
+    
+    def _update_paired(
+        self,
+        states: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Update POST_PROJ cache with new K/V states.
+        
+        Quantization strategy:
+        - Keys: When buffer is full (>= residual_buffer_length), quantize groups to make 
+          buffer valid (< residual_buffer_length)
+        - Values (token-wise, axis=1): Keep buffer full, quantize extra tokens immediately
+        - Values (channel-wise, axis=0): Quantize as many groups as needed to make buffer 
+          valid, keeping smallest possible number of groups
+        """
+        key_states, value_states = states
+        new_tokens = key_states.shape[-2]
+        
+        # Append new states
+        self.keys = torch.cat([self.keys, key_states], dim=-2)
+        self.values = torch.cat([self.values, value_states], dim=-2)
+        current_cache_length = self.keys.shape[-2]
+       
+        # Return copies before quantization
+        keys_to_return = self.keys.detach().clone()
+        values_to_return = self.values.detach().clone()
+
+        # No quantization needed if cache length <= sink_length + residual_buffer_length
+        if current_cache_length <= self.sink_length + self.residual_buffer_length:
+            self.current_residual_k_buffer_length = max(0, current_cache_length - self.sink_length)
+            self.current_residual_v_buffer_length = max(0, current_cache_length - self.sink_length)
+            return keys_to_return, values_to_return
+
+        # Update residual buffer lengths
+        self.current_residual_k_buffer_length += new_tokens
+        
+        # Quantize keys if buffer is full (>= residual_buffer_length)
+        if self.current_residual_k_buffer_length >= self.residual_buffer_length:
+            # Calculate how many groups to quantize to make buffer valid
+            excess = self.current_residual_k_buffer_length - self.residual_buffer_length + 1
+            num_groups_to_quantize = (excess + self.group_size - 1) // self.group_size
+            num_tokens_to_quantize = num_groups_to_quantize * self.group_size
+            
+            # Quantize from the end of previously quantized region
+            start_idx = current_cache_length - self.current_residual_k_buffer_length
+            end_idx = start_idx + num_tokens_to_quantize
+            
+            key_slice = self.keys[..., start_idx:end_idx, :]
+            key_slice = self._fake_quant_groupwise(key_slice, self.group_size, self.kbits, self.kaxis)
+            self.keys[..., start_idx:end_idx, :] = key_slice
+            
+            self.current_residual_k_buffer_length -= num_tokens_to_quantize
+
+        # Quantize values based on axis
+        if self.vaxis == 1:
+            # Token-wise: keep buffer full (residual_buffer_length), quantize extra tokens
+            self.current_residual_v_buffer_length += new_tokens
+            if self.current_residual_v_buffer_length > self.residual_buffer_length:
+                num_tokens_to_quantize_v = self.current_residual_v_buffer_length - self.residual_buffer_length
+                start_idx_v = current_cache_length - self.current_residual_v_buffer_length
+                end_idx_v = start_idx_v + num_tokens_to_quantize_v
+                
+                value_slice = self.values[..., start_idx_v:end_idx_v, :]
+                value_slice = self._fake_quant_groupwise(value_slice, self.group_size, self.vbits, self.vaxis)
+                self.values[..., start_idx_v:end_idx_v, :] = value_slice
+                
+                self.current_residual_v_buffer_length = self.residual_buffer_length
+        else:
+            # Channel-wise: same logic as keys - quantize minimal groups to make buffer valid
+            self.current_residual_v_buffer_length += new_tokens
+            if self.current_residual_v_buffer_length >= self.residual_buffer_length:
+                excess = self.current_residual_v_buffer_length - self.residual_buffer_length + 1
+                num_groups_to_quantize = (excess + self.group_size - 1) // self.group_size
+                num_tokens_to_quantize_v = num_groups_to_quantize * self.group_size
+                
+                start_idx_v = current_cache_length - self.current_residual_v_buffer_length
+                end_idx_v = start_idx_v + num_tokens_to_quantize_v
+                
+                value_slice = self.values[..., start_idx_v:end_idx_v, :]
+                value_slice = self._fake_quant_groupwise(value_slice, self.group_size, self.vbits, self.vaxis)
+                self.values[..., start_idx_v:end_idx_v, :] = value_slice
+                
+                self.current_residual_v_buffer_length -= num_tokens_to_quantize_v
+        
+        return keys_to_return, values_to_return
+    
+    def _update_non_paired(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        Update POST_NORM cache with new hidden states.
+        
+        Same logic as keys: when buffer is full (>= residual_buffer_length), 
+        quantize groups to make buffer valid (< residual_buffer_length).
+        """
+        new_tokens = states.shape[-2]
+        
+        # Append new states
+        self.hidden_states = torch.cat([self.hidden_states, states], dim=-2)
+        current_cache_length = self.hidden_states.shape[-2]
+        
+        # Return copy before quantization
+        states_to_return = self.hidden_states.detach().clone()
+        
+        # No quantization needed if cache length <= sink_length + residual_buffer_length
+        if current_cache_length <= self.sink_length + self.residual_buffer_length:
+            self.current_residual_k_buffer_length = max(0, current_cache_length - self.sink_length)
+            return states_to_return
+        
+        # Update residual buffer length
+        self.current_residual_k_buffer_length += new_tokens
+        
+        # Quantize if buffer is full (>= residual_buffer_length)
+        if self.current_residual_k_buffer_length >= self.residual_buffer_length:
+            # Calculate how many groups to quantize to make buffer valid
+            excess = self.current_residual_k_buffer_length - self.residual_buffer_length + 1
+            num_groups_to_quantize = (excess + self.group_size - 1) // self.group_size
+            num_tokens_to_quantize = num_groups_to_quantize * self.group_size
+            
+            # Quantize from the end of previously quantized region
+            start_idx = current_cache_length - self.current_residual_k_buffer_length
+            end_idx = start_idx + num_tokens_to_quantize
+            
+            hs_slice = self.hidden_states[..., start_idx:end_idx, :]
+            hs_slice = self._fake_quant_groupwise(hs_slice, self.group_size, self.kbits, self.kaxis)
+            self.hidden_states[..., start_idx:end_idx, :] = hs_slice
+            
+            self.current_residual_k_buffer_length -= num_tokens_to_quantize
+        
+        return states_to_return
+
+
+class SimulatedQuantizedLayer(DynamicLayer):
+    """
+    A cache layer that supports simulated quantization (fake quantization).
+    
+    Uses a sink + buffer strategy similar to KIVI:
+    - First `sink_length` tokens are kept in full precision (sink)
+    - Middle tokens are fake-quantized (quantize then immediately dequantize)
+    - Last `residual_buffer_length` tokens are kept in full precision (residual buffer)
+    
+    Supports both paired (POST_PROJ) and non-paired (POST_NORM) content types
+    by delegating to SimulatedQuantizedCacheContent.
+    """
+
+    def __init__(
+        self,
+        cache_config: SimulatedQuantizedCacheConfig,
+        content_type: CacheContentType = CacheContentType.POST_PROJ,
+        paired: bool = True,
+    ) -> None:
+        # Don't call super().__init__() yet - we'll set up content manually
+        self.is_initialized = False
+        self._cache_config = cache_config
+        self._content_type = content_type
+        self._paired = paired
+        # Store config values for convenience
+        self.sink_length = cache_config.sink_length
+        self.residual_buffer_length = cache_config.residual_buffer_length
+        self.group_size = cache_config.group_size
+        self.kbits = cache_config.kbits
+        self.vbits = cache_config.vbits
+        self.kaxis = cache_config.kaxis
+        self.vaxis = cache_config.vaxis
+        
+        # Initialize content as SimulatedQuantizedCacheContent
+        self.content = SimulatedQuantizedCacheContent(
+            content_type=content_type,
+            paired=paired,
+            sink_length=cache_config.sink_length,
+            residual_buffer_length=cache_config.residual_buffer_length,
+            group_size=cache_config.group_size,
+            kbits=cache_config.kbits,
+            vbits=cache_config.vbits,
+            kaxis=cache_config.kaxis,
+            vaxis=cache_config.vaxis,
+            is_simulating=cache_config.is_simulating,
+        )
+
+    @property
+    def content_type(self) -> CacheContentType:
+        return self._content_type
+    
+    @property
+    def content_paired(self) -> bool:
+        return self._paired
+
+    def lazy_initialization(self, states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]):
+        """Initialize the cache layer."""
+        if self.content_paired:
+            key_states, _ = states
+            self.dtype, self.device = key_states.dtype, key_states.device
+        else:
+            self.dtype, self.device = states.dtype, states.device
+        
+        self.is_initialized = True
+
+    def update(
+        self,
+        states: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+        cache_kwargs: Optional[dict[str, Any]] = None,
+    ) -> Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """
+        Update the cache with new states and apply simulated quantization.
+        
+        Args:
+            states: (key_states, value_states) tuple for POST_PROJ,
+                    or hidden_states tensor for POST_NORM
+            cache_kwargs: Additional arguments for the cache.
+
+        Returns:
+            The states to be used for attention (before in-place quantization)
+        """
+        if not self.is_initialized:
+            self.lazy_initialization(states)
+            # Delegate to content for initialization
+            return self.content.initialize(states)
+        
+        # Delegate to content for update
+        return self.content.update(states)
 
 class StaticCache(Cache):
     """
@@ -2228,9 +2787,9 @@ class QuantizedCache(Cache):
         self,
         backend: str,
         config: PreTrainedConfig,
-        nbits: int = 4,
+        nbits: Union[int, Tuple[int, int]] = 4,
         axis_key: int = 0,
-        axis_value: int = 0,
+        axis_value: int = 1,
         q_group_size: int = 64,
         residual_length: int = 128,
         content_type: Union[CacheContentType, str] = CacheContentType.POST_PROJ,
@@ -2243,17 +2802,39 @@ class QuantizedCache(Cache):
             layer_class = HQQQuantizedLayer
         elif backend == "custom":
             layer_class = QuantizedLayerWithQuantizer
+        elif backend == "simulated":
+            layer_class = SimulatedQuantizedLayer
         else:
             raise ValueError(f"Unknown quantization backend `{backend}`")
 
         content_type = CacheContentType.from_string(content_type) if isinstance(content_type, str) else content_type
 
         config = config.get_text_config(decoder=True)
-        self.content_paired = use_paired_cache(config)
+        self.content_paired = requires_kv_projection(config)
+        if isinstance(nbits, int):
+            nbits = (nbits, nbits)
         # Create layers with or without quantizer parameter depending on backend
         if backend == "custom":
             layers = [
-                layer_class(quantizer, nbits, (axis_key, axis_value), q_group_size, residual_length, content_type, paired=self.content_paired, is_simulating=is_simulating)
+                layer_class(quantizer, nbits[0], (axis_key, axis_value), q_group_size, residual_length, content_type, paired=self.content_paired, is_simulating=is_simulating)
+                for _ in range(config.num_hidden_layers)
+            ]
+        elif backend == "simulated":
+            layers = [
+                layer_class(
+                    SimulatedQuantizedCacheConfig(
+                        sink_length=0, #TODO: covert to configurable value later
+                        residual_buffer_length=residual_length,
+                        group_size=q_group_size,
+                        kbits=nbits[0],
+                        vbits=nbits[1],
+                        kaxis=axis_key,
+                        vaxis=axis_value,
+                        is_simulating=is_simulating,
+                    ),
+                    content_type=content_type,
+                    paired=self.content_paired,
+                )
                 for _ in range(config.num_hidden_layers)
             ]
         else:
@@ -2262,6 +2843,689 @@ class QuantizedCache(Cache):
                 for _ in range(config.num_hidden_layers)
             ]
         super().__init__(layers=layers, content_type=content_type)
+
+
+class SimulatedQuantizedCache(Cache):
+    """
+    A cache that simulates quantization effects without actually packing data to lower precision.
+    This is useful for measuring quantization error and studying the impact of quantization on model quality.
+    
+    Uses a sink + buffer strategy similar to KIVI:
+    - First `sink_length` tokens are kept in full precision (sink)
+    - Middle tokens are fake-quantized (quantize then immediately dequantize to simulate quantization error)
+    - Last `residual_buffer_length` tokens are kept in full precision (buffer)
+    
+    See `Cache` for details on common methods that are implemented by all cache classes.
+
+    Args:
+        config (`PreTrainedConfig`):
+            The config of the model for which this Cache will be used.
+        nbits (`Union[int, Tuple[int, int]]`, *optional*, defaults to 4):
+            The number of bits for quantization. Can be a single int (same for keys and values)
+            or a tuple (kbits, vbits).
+        axis_key (`int`, *optional*, defaults to 0):
+            The axis on which to quantize the keys (0=channel-wise, 1=token-wise).
+        axis_value (`int`, *optional*, defaults to 1):
+            The axis on which to quantize the values (0=channel-wise, 1=token-wise).
+        group_size (`int`, *optional*, defaults to 64):
+            Quantization is done per-channel according to a set `group_size`.
+        sink_length (`int`, *optional*, defaults to 0):
+            Number of initial tokens to keep in full precision.
+        residual_buffer_length (`int`, *optional*, defaults to 128):
+            Maximum capacity for the residual (recent tokens) full precision buffer.
+        content_type (`CacheContentType`, *optional*, defaults to `POST_PROJ`):
+            The type of content to be cached.
+    
+    Example:
+
+    ```python
+    >>> from transformers import AutoTokenizer, AutoModelForCausalLM, SimulatedQuantizedCache
+
+    >>> model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B")
+    >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+
+    >>> inputs = tokenizer(text="My name is Llama", return_tensors="pt")
+
+    >>> # Prepare a cache with simulated 2-bit quantization
+    >>> past_key_values = SimulatedQuantizedCache(config=model.config, nbits=2)
+    >>> outputs = model(**inputs, past_key_values=past_key_values, use_cache=True)
+    ```
+    """
+
+    def __init__(
+        self,
+        config: PreTrainedConfig,
+        nbits: Union[int, Tuple[int, int]] = 4,
+        axis_key: int = 0,
+        axis_value: int = 1,
+        group_size: int = 64,
+        sink_length: int = 0,
+        residual_buffer_length: int = 128,
+        content_type: Union[CacheContentType, str] = CacheContentType.POST_PROJ,
+    ):
+        content_type = CacheContentType.from_string(content_type) if isinstance(content_type, str) else content_type
+        
+        config = config.get_text_config(decoder=True)
+        self.content_paired = requires_kv_projection(config)
+        
+        if isinstance(nbits, int):
+            kbits, vbits = nbits, nbits
+        else:
+            kbits, vbits = nbits
+        
+        cache_config = SimulatedQuantizedCacheConfig(
+            sink_length=sink_length,
+            residual_buffer_length=residual_buffer_length,
+            group_size=group_size,
+            kbits=kbits,
+            vbits=vbits,
+            kaxis=axis_key,
+            vaxis=axis_value,
+        )
+        
+        layers = [
+            SimulatedQuantizedLayer(
+                cache_config=cache_config,
+                content_type=content_type,
+                paired=self.content_paired,
+            )
+            for _ in range(config.num_hidden_layers)
+        ]
+        
+        super().__init__(layers=layers, content_type=content_type)
+
+
+@dataclass
+class SimulatedCLQuantizedCacheConfig:
+    """
+    Configuration class for Simulated Cross-Layer (CL) Quantized cache settings.
+    
+    Used for XQuant-CL: Quantizes the deltas between successive layers' hidden states.
+    
+    For GQA models (when U_kv projection is provided):
+    - W_kv = [W_k | W_v] has shape (hidden_dim, 2 * kv_dim)
+    - SVD: W_kv = U_kv @ Σ_kv @ B_kv^T
+    - Store quantized latent deltas: ΔX_i @ U_kv (shape: seq_len × 2*kv_dim)
+    - Same memory footprint as KV cache, with deltas having smaller ranges, hence being easier to quantize
+    
+    For non-GQA models (when U_kv is None):
+    - Store deltas directly without projection
+    """
+    residual_buffer_length: int = 128  # Buffer for recent tokens in full precision
+    group_size: int = 64               # Group size for quantization
+    nbits: int = 2                      # Quantization bit width for deltas
+    axis: int = 0                      # Axis for quantization (0=channel-wise)
+    first_layer_bits: int = 16         # Bits for layer 0 (16 means full precision)
+    is_simulating: bool = False        # Whether to force fake quantization on first pass
+
+
+class SimulatedCLQuantizedCacheContent(CacheContent):
+    """
+    Cache content that implements simulated cross-layer (CL) quantization based on XQuant-CL.
+    
+    XQuant-CL exploits cross-layer similarity in hidden states (reported by numerous prior works):
+    - Layer 0: Store X_0 in higher precision (first_layer_bits)
+    - Layers 1+: Store quantized deltas ΔX̂_i = Q(X_i - X̂_{i-1})
+    - Reconstruction: X̂_i = X_0 + Σ_{j=1}^{i} ΔX̂_j
+    
+    Since deltas have smaller range than raw values, they are more amenable
+    to aggressive quantization (2-3 bits) while maintaining accuracy.
+    
+    For GQA models (when U_kv projection is set):
+    - Deltas are down-projected: latent_delta = ΔX_i @ U_kv
+    - Stored deltas have shape (seq_len, 2*kv_dim) instead of (seq_len, hidden_dim)
+    - Reconstruction up-projects: delta_upproj = latent_delta @ U_kv^T
+    
+    This content class is for a SINGLE layer. The cross-layer coordination
+    is handled by the cache class which maintains references between layers.
+    
+    Args:
+        content_type: Type of content (should be POST_NORM_CL for CL mode)
+        layer_idx: Index of this layer (0 = base layer, 1+ = delta layers)
+        residual_buffer_length: Number of recent tokens in full precision
+        group_size: Group size for quantization
+        bits: Quantization bit width for this layer
+        axis: Axis for quantization (0=channel-wise, 1=token-wise)
+    """
+    
+    def __init__(
+        self,
+        content_type: CacheContentType,
+        layer_idx: int,
+        residual_buffer_length: int = 128,
+        group_size: int = 64,
+        nbits: int = 4,
+        axis: int = 0,
+        is_simulating: bool = False,
+    ):
+        # Cross-layer mode is always non-paired (hidden states only)
+        super().__init__(content_type, paired=False)
+        self.layer_idx = layer_idx
+        self.residual_buffer_length = residual_buffer_length
+        self.current_residual_buffer_length = 0
+        self.group_size = group_size
+        self.nbits = nbits
+        self.axis = axis
+        self.is_simulating = is_simulating
+        
+        # Optional projection matrix U_kv from SVD of [W_k | W_v] for GQA models
+        # Shape: (hidden_dim, 2*kv_dim) - set via set_projection() for GQA models
+        self._U_kv: Optional[torch.Tensor] = None
+        
+        # For layer 0: stores the base hidden states
+        # For layer > 0: stores the (optionally down-projected) deltas
+        self.hidden_states: Optional[torch.Tensor] = None
+        
+        # Reference to previous layer's content (set by the Cache class)
+        self._prev_layer_content: Optional[SimulatedCLQuantizedCacheContent] = None
+        
+        # Cached reconstruction for efficiency during decoding
+        # X̂_i = X_0 + Σ_{j=1}^{i} ΔX̂_j (in full dimension)
+        self._reconstructed: Optional[torch.Tensor] = None
+    
+    def set_projection(self, U_kv: torch.Tensor):
+        """Set the projection matrix U_kv for this layer (for GQA models)."""
+        self._U_kv = U_kv
+    
+    def get_reconstruction(self) -> torch.Tensor:
+        """
+        Get the reconstructed hidden states for this layer (full dimension).
+        
+        For layer 0: Returns the stored hidden states directly
+        For layer > 0: Returns X̂_i = X̂_{i-1} + ΔX̂_i (using cached reconstruction)
+        """
+        if self.layer_idx == 0:
+            return self.hidden_states
+        else:
+            return self._reconstructed
+    
+    def get_latent_states(self) -> torch.Tensor:
+        """
+        Get the stored latent states.
+        
+        For layer 0: Returns hidden_states @ U_kv (down-projected) if U_kv is set,
+                     otherwise returns hidden_states directly
+        For layer > 0: Returns the stored (possibly latent) deltas
+        """
+        if self.layer_idx == 0:
+            if self._U_kv is not None:
+                return self.hidden_states @ self._U_kv
+            return self.hidden_states
+        else:
+            return self.hidden_states
+    
+    def initialize(
+        self,
+        states: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Initialize the cache with initial states.
+        
+        For layer 0: Store states directly (with optional quantization)
+        For layer > 0: Compute and store delta from previous layer's reconstruction
+        
+        Args:
+            states: The input hidden states X_i for this layer
+            
+        Returns:
+            The states to return for attention (before quantization is applied)
+        """
+        if self.layer_idx == 0:
+            return self._initialize_base_layer(states)
+        else:
+            return self._initialize_delta_layer(states)
+    
+    def _initialize_base_layer(self, states: torch.Tensor) -> torch.Tensor:
+        """Initialize layer 0 with the base hidden states."""
+        # Store the full states
+        self.hidden_states = states.detach().clone()
+        self._reconstructed = self.hidden_states
+        current_cache_length = self.hidden_states.shape[-2]
+        
+        # Return copy before quantization
+        states_to_return = self.hidden_states.detach().clone()
+        
+        # For base layer, apply standard quantization if bits < 16 (default 16 bits - full precision )
+        if self.nbits < 16:
+            # No buffer logic for base layer - just quantize middle portion
+            if current_cache_length <= self.residual_buffer_length:
+                self.current_residual_buffer_length = current_cache_length
+                return states_to_return
+            
+            # Quantize all but the residual buffer
+            num_tokens_to_quantize = current_cache_length - self.residual_buffer_length
+            # Round down to group_size
+            num_tokens_to_quantize = (num_tokens_to_quantize // self.group_size) * self.group_size
+            self.current_residual_buffer_length = current_cache_length - num_tokens_to_quantize
+            
+            if num_tokens_to_quantize > 0:
+                hs_slice = self.hidden_states[..., :num_tokens_to_quantize, :]
+                hs_slice = SimulatedQuantizedCacheContent._fake_quant_groupwise(
+                    hs_slice, self.group_size, self.nbits, self.axis
+                )
+                self.hidden_states[..., :num_tokens_to_quantize, :] = hs_slice
+                # Update reconstruction to match quantized base
+                self._reconstructed = self.hidden_states
+        else:
+            self.current_residual_buffer_length = current_cache_length
+        
+        # When simulating, return the quantized states to measure quantization effect on perplexity
+        if self.is_simulating:
+            return self.hidden_states.detach().clone()
+        
+        return states_to_return
+    
+    def _initialize_delta_layer(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        Initialize layer > 0 by computing and storing the delta from previous layer.
+        
+        Delta: ΔX_i = X_i - X̂_{i-1}
+        
+        If U_kv is set (GQA mode):
+        - Down-project delta: latent_delta = ΔX_i @ U_kv
+        - Store latent_delta (shape: seq_len, 2*kv_dim)
+        - Reconstruction up-projects: X̂_i = X̂_{i-1} + latent_delta @ U_kv^T
+        """
+        assert self._prev_layer_content is not None, "Previous layer content not set"
+        
+        # Get the previous layer's reconstruction
+        prev_reconstruction = self._prev_layer_content.get_reconstruction()
+        
+        # Compute delta in full dimension
+        delta = states - prev_reconstruction
+        
+        # Down-project if U_kv is set (GQA mode)
+        if self._U_kv is not None:
+            # (batch, seq_len, hidden_dim) @ (hidden_dim, 2*kv_dim)
+            delta_to_store = delta @ self._U_kv
+        else:
+            delta_to_store = delta
+        
+        # Store the (optionally down-projected) delta
+        self.hidden_states = delta_to_store.detach().clone()
+        current_cache_length = self.hidden_states.shape[-2]
+        
+        # Return original states before quantization
+        states_to_return = states.detach().clone()
+        
+        # Apply quantization to the delta
+        if current_cache_length <= self.residual_buffer_length:
+            self.current_residual_buffer_length = current_cache_length
+            # Compute reconstruction
+            self._update_reconstruction(prev_reconstruction)
+            # When simulating, return the reconstructed states (with quantization effects)
+            if self.is_simulating:
+                return self._reconstructed.detach().clone()
+            return states_to_return
+        
+        # Quantize all but the residual buffer
+        num_tokens_to_quantize = current_cache_length - self.residual_buffer_length
+        # Round down to group_size
+        num_tokens_to_quantize = (num_tokens_to_quantize // self.group_size) * self.group_size
+        self.current_residual_buffer_length = current_cache_length - num_tokens_to_quantize
+        
+        if num_tokens_to_quantize > 0:
+            delta_slice = self.hidden_states[..., :num_tokens_to_quantize, :]
+            delta_slice = SimulatedQuantizedCacheContent._fake_quant_groupwise(
+                delta_slice, self.group_size, self.nbits, self.axis
+            )
+            self.hidden_states[..., :num_tokens_to_quantize, :] = delta_slice
+        
+        # Compute reconstruction
+        self._update_reconstruction(prev_reconstruction)
+        
+        # When simulating, return the reconstructed states (with quantization effects)
+        # to measure quantization effect on perplexity
+        if self.is_simulating:
+            return self._reconstructed.detach().clone()
+        
+        return states_to_return
+    
+    def _update_reconstruction(self, prev_reconstruction: torch.Tensor):
+        """
+        Update the cached reconstruction from stored deltas.
+        
+        If U_kv is set, up-projects the latent deltas before adding.
+        """
+        if self._U_kv is not None:
+            # Up-project: (batch, seq_len, 2*kv_dim) @ (2*kv_dim, hidden_dim)
+            delta_upproj = self.hidden_states @ self._U_kv.T
+            self._reconstructed = prev_reconstruction + delta_upproj
+        else:
+            self._reconstructed = prev_reconstruction + self.hidden_states
+    
+    def update(
+        self,
+        states: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Update the cache with new states.
+        
+        For layer 0: Append and quantize as needed
+        For layer > 0: Compute delta from previous layer and quantize
+        
+        Args:
+            states: New hidden states to add
+            
+        Returns:
+            The full updated states for attention
+        """
+        if self.layer_idx == 0:
+            return self._update_base_layer(states)
+        else:
+            return self._update_delta_layer(states)
+    
+    def _update_base_layer(self, states: torch.Tensor) -> torch.Tensor:
+        """Update layer 0 with new hidden states."""
+        new_tokens = states.shape[-2]
+        
+        # Append new states
+        self.hidden_states = torch.cat([self.hidden_states, states], dim=-2)
+        self._reconstructed = self.hidden_states
+        current_cache_length = self.hidden_states.shape[-2]
+        
+        # Return copy before quantization
+        states_to_return = self.hidden_states.detach().clone()
+        
+        if self.nbits >= 16:
+            self.current_residual_buffer_length = current_cache_length
+            return states_to_return
+        
+        # Update buffer length
+        self.current_residual_buffer_length += new_tokens
+        
+        # Quantize if buffer is full
+        if self.current_residual_buffer_length >= self.residual_buffer_length:
+            # Calculate how many groups to quantize
+            excess = self.current_residual_buffer_length - self.residual_buffer_length + 1
+            num_groups_to_quantize = (excess + self.group_size - 1) // self.group_size
+            num_tokens_to_quantize = num_groups_to_quantize * self.group_size
+            
+            # Quantize from the end of previously quantized region
+            start_idx = current_cache_length - self.current_residual_buffer_length
+            end_idx = start_idx + num_tokens_to_quantize
+            
+            hs_slice = self.hidden_states[..., start_idx:end_idx, :]
+            hs_slice = SimulatedQuantizedCacheContent._fake_quant_groupwise(
+                hs_slice, self.group_size, self.nbits, self.axis
+            )
+            self.hidden_states[..., start_idx:end_idx, :] = hs_slice
+            self._reconstructed = self.hidden_states
+            
+            self.current_residual_buffer_length -= num_tokens_to_quantize
+        
+        return states_to_return
+    
+    def _update_delta_layer(self, states: torch.Tensor) -> torch.Tensor:
+        """Update layer > 0 by computing and storing the delta."""
+        assert self._prev_layer_content is not None, "Previous layer content not set"
+        
+        new_tokens = states.shape[-2]
+        
+        # Get the previous layer's reconstruction
+        prev_reconstruction = self._prev_layer_content.get_reconstruction()
+        
+        # Compute delta for new tokens only
+        # prev_reconstruction includes the new token from the previous layer update
+        delta_new = states - prev_reconstruction[..., -new_tokens:, :]
+        
+        # Down-project if U_kv is set (GQA mode)
+        if self._U_kv is not None:
+            delta_new_to_store = delta_new @ self._U_kv
+        else:
+            delta_new_to_store = delta_new
+        
+        # Append delta
+        self.hidden_states = torch.cat([self.hidden_states, delta_new_to_store], dim=-2)
+        current_cache_length = self.hidden_states.shape[-2]
+        
+        # Compute full reconstruction for return
+        self._update_reconstruction(prev_reconstruction)
+        states_to_return = self._reconstructed.detach().clone()
+        
+        # Update buffer length
+        self.current_residual_buffer_length += new_tokens
+        
+        # Quantize if buffer is full
+        if self.current_residual_buffer_length >= self.residual_buffer_length:
+            # Calculate how many groups to quantize
+            excess = self.current_residual_buffer_length - self.residual_buffer_length + 1
+            num_groups_to_quantize = (excess + self.group_size - 1) // self.group_size
+            num_tokens_to_quantize = num_groups_to_quantize * self.group_size
+            
+            # Quantize from the end of previously quantized region
+            start_idx = current_cache_length - self.current_residual_buffer_length
+            end_idx = start_idx + num_tokens_to_quantize
+            
+            delta_slice = self.hidden_states[..., start_idx:end_idx, :]
+            delta_slice = SimulatedQuantizedCacheContent._fake_quant_groupwise(
+                delta_slice, self.group_size, self.nbits, self.axis
+            )
+            self.hidden_states[..., start_idx:end_idx, :] = delta_slice
+            
+            # Update reconstruction with quantized deltas
+            self._update_reconstruction(prev_reconstruction)
+            
+            self.current_residual_buffer_length -= num_tokens_to_quantize
+        
+        return states_to_return
+
+
+class SimulatedCLQuantizedLayer(DynamicLayer):
+    """
+    A cache layer that supports simulated cross-layer (CL) quantization.
+    
+    Based on XQuant-CL paper: Quantizes deltas between successive layers
+    for more aggressive compression while maintaining accuracy.
+    
+    This layer stores either:
+    - Layer 0: Base hidden states (potentially quantized with first_layer_bits)
+    - Layer > 0: Quantized deltas from previous layer's reconstruction
+    
+    For GQA models, an optional U_kv projection matrix can be set via set_projection()
+    or passed in cache_kwargs, which down-projects deltas to latent space (2*kv_dim).
+    """
+
+    def __init__(
+        self,
+        cache_config: SimulatedCLQuantizedCacheConfig,
+        layer_idx: int,
+        content_type: CacheContentType = CacheContentType.POST_NORM_CL,
+    ) -> None:
+        self.is_initialized = False
+        self._cache_config = cache_config
+        self._content_type = content_type
+        self._layer_idx = layer_idx
+        
+        # Determine bits for this layer
+        nbits = cache_config.first_layer_bits if layer_idx == 0 else cache_config.nbits
+        
+        # Initialize content
+        self.content = SimulatedCLQuantizedCacheContent(
+            content_type=content_type,
+            layer_idx=layer_idx,
+            residual_buffer_length=cache_config.residual_buffer_length,
+            group_size=cache_config.group_size,
+            nbits=nbits,
+            axis=cache_config.axis,
+            is_simulating=cache_config.is_simulating,
+        )
+
+    @property
+    def content_type(self) -> CacheContentType:
+        return self._content_type
+    
+    @property
+    def content_paired(self) -> bool:
+        return False  # CL mode is always non-paired (hidden states only)
+    
+    @property
+    def layer_idx(self) -> int:
+        return self._layer_idx
+    
+    @property
+    def hidden_states(self) -> Optional[torch.Tensor]:
+        """Get the stored data (base states for layer 0, deltas for layer > 0)."""
+        return self.content.hidden_states
+    
+    @hidden_states.setter
+    def hidden_states(self, value: torch.Tensor):
+        """Set the stored data."""
+        self.content.hidden_states = value
+    
+    def get_reconstruction(self) -> torch.Tensor:
+        """Get the reconstructed hidden states for this layer."""
+        return self.content.get_reconstruction()
+    
+    def get_latent_states(self) -> torch.Tensor:
+        """Get the latent states (for layer 0: down-projected, for layer > 0: stored deltas)."""
+        return self.content.get_latent_states()
+    
+    def set_prev_layer_content(self, prev_content: SimulatedCLQuantizedCacheContent):
+        """Set reference to previous layer's content for delta computation."""
+        self.content._prev_layer_content = prev_content
+    
+    def set_projection(self, U_kv: torch.Tensor):
+        """Set the projection matrix U_kv for this layer (for GQA models)."""
+        self.content.set_projection(U_kv)
+
+    def lazy_initialization(self, states: torch.Tensor):
+        """Initialize the cache layer."""
+        self.dtype, self.device = states.dtype, states.device
+        self.is_initialized = True
+
+    def update(
+        self,
+        states: torch.Tensor,
+        cache_kwargs: Optional[dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """
+        Update the cache with new states and apply simulated CL quantization.
+        
+        Args:
+            states: Hidden states tensor
+            cache_kwargs: Additional arguments (may contain 'U_kv' for GQA)
+
+        Returns:
+            The reconstructed states for attention
+        """
+        # Set projection matrix if provided
+        if cache_kwargs is not None and "U_kv" in cache_kwargs:
+            self.set_projection(cache_kwargs["U_kv"])
+        
+        if not self.is_initialized:
+            self.lazy_initialization(states)
+            return self.content.initialize(states)
+        
+        return self.content.update(states)
+
+
+class SimulatedCLQuantizedCache(Cache):
+    """
+    A cache that simulates cross-layer (CL) quantization effects based on XQuant-CL.
+    
+    XQuant-CL exploits the observation that hidden states across successive layers
+    are similar due to the residual stream in Transformers. Instead of
+    quantizing X directly, it quantizes the deltas between layers:
+    
+    - Layer 0: Store X_0 (optionally quantized with first_layer_bits)
+    - Layer i>0: Store ΔX̂_i = Q(X_i - X̂_{i-1})
+    - Reconstruction: X̂_i = X_0 + Σ_{j=1}^{i} ΔX̂_j
+    
+    Since deltas have smaller range, they can be quantized more aggressively
+    (2-3 bits) while maintaining accuracy comparable to FP16.
+    
+    For GQA models (Llama, Mistral, Gemma, Qwen, etc.):
+    - Set U_kv projection matrices via set_projections() or pass 'U_kv' in cache_kwargs
+      for each layer during update (lazy per-layer initialization)
+    - Deltas are down-projected: latent_delta = ΔX_i @ U_kv (shape: seq_len × 2*kv_dim)
+    - Same memory footprint as KV cache, but deltas are easier to quantize
+    
+    Note: This cache uses POST_NORM_CL content type (hidden states).
+
+    Args:
+        config (`PreTrainedConfig`):
+            The config of the model for which this Cache will be used.
+        bits (`int`, *optional*, defaults to 2):
+            The number of bits for delta quantization (layers > 0).
+        axis (`int`, *optional*, defaults to 0):
+            The axis on which to quantize (0=channel-wise, 1=token-wise).
+        group_size (`int`, *optional*, defaults to 64):
+            Quantization group size.
+        residual_buffer_length (`int`, *optional*, defaults to 128):
+            Number of recent tokens to keep in full precision.
+        first_layer_bits (`int`, *optional*, defaults to 16):
+            Bits for layer 0 (16 = full precision).
+    
+    Example:
+
+    ```python
+    >>> from transformers import AutoTokenizer, AutoModelForCausalLM, SimulatedCLQuantizedCache
+
+    >>> model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B")
+    >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+
+    >>> inputs = tokenizer(text="My name is Llama", return_tensors="pt")
+
+    >>> # Prepare a cache with simulated CL 2-bit quantization
+    >>> past_key_values = SimulatedCLQuantizedCache(config=model.config, bits=2)
+    >>> outputs = model(**inputs, past_key_values=past_key_values, use_cache=True)
+    ```
+    """
+
+    def __init__(
+        self,
+        config: PreTrainedConfig,
+        nbits: int = 2,
+        axis: int = 0,
+        group_size: int = 64,
+        residual_buffer_length: int = 128,
+        first_layer_bits: int = 16,
+        is_simulating: bool = False,
+    ):
+        config = config.get_text_config(decoder=True)
+        content_type = CacheContentType.POST_NORM_CL
+        self.content_paired = False
+        # For CL quantization, content is always non-paired (hidden states only),
+        # but we need to know if projections are required
+        self.requires_down_proj = requires_kv_projection(config)
+        cache_config = SimulatedCLQuantizedCacheConfig(
+            residual_buffer_length=residual_buffer_length,
+            group_size=group_size,
+            nbits=nbits,
+            axis=axis,
+            first_layer_bits=first_layer_bits,
+            is_simulating=is_simulating
+        )
+        
+        # Create layers
+        layers = [
+            SimulatedCLQuantizedLayer(
+                cache_config=cache_config,
+                layer_idx=i,
+                content_type=content_type,
+            )
+            for i in range(config.num_hidden_layers)
+        ]
+        
+        # Set up cross-layer references (layer i points to layer i-1)
+        for i in range(1, len(layers)):
+            layers[i].set_prev_layer_content(layers[i - 1].content)
+        
+        super().__init__(layers=layers, content_type=content_type)
+    
+    def set_projections(self, projections: list[torch.Tensor]):
+        """
+        Set the U_kv projection matrices for all layers (for GQA models).
+        
+        Args:
+            projections: List of U_kv matrices, one per layer.
+                        Each matrix has shape (hidden_dim, 2*kv_dim).
+        """
+        assert len(projections) == len(self.layers), \
+            f"Expected {len(self.layers)} projections, got {len(projections)}"
+        for layer, U_kv in zip(self.layers, projections):
+            layer.set_projection(U_kv)
 
 
 class EncoderDecoderCache(Cache):

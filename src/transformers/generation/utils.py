@@ -33,6 +33,7 @@ from ..cache_utils import (
     EncoderDecoderCache,
     QuantizedCache,
     StaticCache,
+    SimulatedCLQuantizedCache,
 )
 from ..dynamic_module_utils import (
     check_python_requirements,
@@ -2065,7 +2066,10 @@ class GenerationMixin(ContinuousMixin):
                         "You need to install `HQQ` in order to use KV cache quantization with HQQ backend. "
                         "Please install it via  with `pip install hqq`"
                     )
-                model_kwargs[cache_name] = QuantizedCache(backend=backend, **cache_config)
+                if backend == 'simulated' and cache_config.pop('content_type', None) == 'post_norm_cl':
+                    model_kwargs[cache_name] = SimulatedCLQuantizedCache(**cache_config)
+                else:
+                    model_kwargs[cache_name] = QuantizedCache(backend=backend, **cache_config)
             elif generation_config.cache_implementation == "offloaded":
                 model_kwargs[cache_name] = DynamicCache(**dynamic_cache_kwargs, offloading=True)
             elif "dynamic" in generation_config.cache_implementation:
